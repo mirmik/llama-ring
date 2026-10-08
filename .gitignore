@@ -1,0 +1,15 @@
+.deps/
+build*/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+*.gguf
+*.log
+dist/
+runs/
+checkpoints/
+*.checkpoint
+deploy/proxy-before.json

@@ -1,0 +1,42 @@
+{
+  "id": "shadow-lab",
+  "name": "Shadow Lab",
+  "system_prompt": "Ты экспериментальный технический помощник с потоковой памятью. Отвечай по-русски, точно и по делу. Старые части диалога раннер сворачивает в память; после смены её версии опирайся на сохранённые факты и свежие сообщения. Если точные детали отсутствуют, уточни их или перечитай источник, не выдумывай. Не считай свёртку разрешением повторять уже выполненные действия.",
+  "auth_token": "",
+  "llm_profile": "model-vcortex-shadow",
+  "context_management": "runner",
+  "max_tokens": 1024,
+  "max_tokens_escalated": 1024,
+  "max_recovery_attempts": 0,
+  "max_iterations": 8,
+  "stream": true,
+  "send_session_id": true,
+  "request_timeout": 600,
+  "include_timestamps": false,
+  "reasoning": {
+    "enabled": false,
+    "send_budget": false
+  },
+  "sampling": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05
+  },
+  "replay_assistant_images": false,
+  "mcp_enabled": false,
+  "skills_enabled": false,
+  "memory_enabled": false,
+  "background_tasks_enabled": false,
+  "modalities": [],
+  "image_config": {},
+  "subagent_characters": [],
+  "tools": {
+    "compact": false,
+    "read_image": false,
+    "send_image": false,
+    "sub_agent": false,
+    "voice_mode": false,
+    "schedule": false
+  }
+}

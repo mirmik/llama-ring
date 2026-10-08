@@ -1,0 +1,3 @@
+# HTTP runtime dependency. The native worker is built separately with CMake.
+aiohttp>=3.12,<4
+Pillow>=10,<13

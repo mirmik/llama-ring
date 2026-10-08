@@ -1,0 +1,12 @@
+{
+  "name": "vcortex-shadow",
+  "driver": "llama_cpp",
+  "gpu": "local",
+  "autoload": false,
+  "on_demand": true,
+  "port": 18197,
+  "slots": 1,
+  "context": 32768,
+  "startup_timeout": 300,
+  "command": "{python} /path/to/llama-ring/scripts/serve.py --worker /path/to/llama-ring/build/bin/llama-shadow-worker --model /path/to/model.gguf --model-name {name} --host 127.0.0.1 --port {port} --prefix 8192 --context 32768 --max-output 2048 --max-summary 2048 --max-sessions {slots} --quantum 64 --cache-type q8_0 --ram-rotation 1 --slot-save-path {runtime_kv}"
+}

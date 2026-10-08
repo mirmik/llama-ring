@@ -1,0 +1,41 @@
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -719,6 +719,11 @@
+     // Memory
+     //
+ 
++    // vcortex experiment: borrowed hybrid components; lifetime is the parent context.
++    // Return NULL for non-hybrid memory. Mutations require caller-managed coherence.
++    LLAMA_API llama_memory_t llama_memory_hybrid_attention(llama_memory_t mem);
++    LLAMA_API llama_memory_t llama_memory_hybrid_recurrent(llama_memory_t mem);
++
+     // Clear the memory contents
+     // If data == true, the data buffers will also be cleared together with the metadata
+     LLAMA_API void llama_memory_clear(
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-ext.h"
+@@ -3849,6 +3850,16 @@
+     mem->clear(data);
+ }
+ 
++llama_memory_t llama_memory_hybrid_attention(llama_memory_t mem) {
++    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
++    return hybrid ? hybrid->get_mem_attn() : nullptr;
++}
++
++llama_memory_t llama_memory_hybrid_recurrent(llama_memory_t mem) {
++    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
++    return hybrid ? hybrid->get_mem_recr() : nullptr;
++}
++
+ bool llama_memory_seq_rm(
+         llama_memory_t mem,
+           llama_seq_id seq_id,

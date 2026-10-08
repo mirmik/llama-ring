@@ -1,0 +1,27 @@
+{
+  "server": "http://127.0.0.1:8097",
+  "model": "vcortex-shadow",
+  "llm_profile": null,
+  "context_size": null,
+  "max_tokens": 2048,
+  "stream": true,
+  "send_session_id": true,
+  "request_timeout": 600,
+  "reasoning": {
+    "enabled": false,
+    "send_budget": false
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05
+  },
+  "modalities": null,
+  "image_config": null,
+  "replay_assistant_images": false,
+  "tools": {
+    "read_image": false,
+    "send_image": false
+  }
+}

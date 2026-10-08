@@ -1,0 +1,23 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -602,8 +602,7 @@
+         if (cells.seq_has(i, seq_id)) {
+             if (hparams.n_pos_per_embd() > 1) {
+                 auto ext = cells.ext_get(i);
+-                // Only broadcast text coordinates are supported by this opt-in.
+-                GGML_ASSERT(ext.x == cells.pos_get(i) && ext.y == cells.pos_get(i));
++                // Uniform translation of every M-RoPE axis preserves image-grid offsets.
+                 ext.x += shift;
+                 ext.y += shift;
+                 cells.ext_set(i, ext);
+@@ -1182,8 +1181,8 @@
+         return false;
+     }
+     if (hparams.n_pos_per_embd() > 1) {
+-        // Text-only Qwen35 broadcasts the scalar position to all M-RoPE axes.
+-        // In that restricted case the existing NEOX K-shift is applicable.
++        // Qwen35: only uniform translations of all M-RoPE axes are supported.
++        // The same delta on every axis permits the existing NEOX K-shift.
+         const char * text_shift = getenv("VCORTEX_QWEN35_TEXT_SHIFT");
+         return model.arch == LLM_ARCH_QWEN35 && text_shift && strcmp(text_shift, "1") == 0;
+     }

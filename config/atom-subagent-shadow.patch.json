@@ -1,0 +1,7 @@
+{
+  "id": "atom-subagent",
+  "llm_profile": "model-vcortex-shadow",
+  "context_management": "runner",
+  "send_session_id": true,
+  "request_timeout": 600
+}

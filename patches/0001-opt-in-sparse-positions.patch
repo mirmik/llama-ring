@@ -1,0 +1,16 @@
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -294,7 +294,12 @@
+ 
+             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
+ 
+-            if (p0 >= 0) {
++            // vcortex experiment: permit gaps and insertion into vacant earlier positions.
++            // Only for a caller that tracks occupancy and uses full causal attention.
++            // Preserve the normal API contract unless explicitly opted in. This does
++            // not relax within-batch continuity or implement overwrite semantics.
++            const char * sparse = getenv("VCORTEX_LLAMA_ALLOW_NONCONTIGUOUS");
++            if (p0 >= 0 && !(sparse && strcmp(sparse, "1") == 0)) {
+                 bool ok = true;
+ 
+                 if (seq_pos_min(s) != p0 + 1) {

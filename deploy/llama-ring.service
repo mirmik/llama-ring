@@ -1,0 +1,15 @@
+# Example systemd user unit. Replace both /path/to paths before installing.
+[Unit]
+Description=llama-ring experimental shadow memory server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/llama-ring
+ExecStart=/path/to/llama-ring/.venv/bin/python scripts/serve.py --model /path/to/model.gguf --context 32768 --prefix 8192 --max-summary 2048 --max-output 2048 --max-sessions 1 --cache-type q8_0 --ram-rotation 1
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

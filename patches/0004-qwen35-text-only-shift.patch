@@ -1,0 +1,38 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -570,7 +570,7 @@
+     }
+ 
+     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
++    GGML_ASSERT(hparams.n_pos_per_embd() == 1 || get_can_shift());
+ 
+     auto & cells = v_cells[seq_to_stream[seq_id]];
+     auto & head  = v_heads[seq_to_stream[seq_id]];
+@@ -600,6 +600,14 @@
+         }
+ 
+         if (cells.seq_has(i, seq_id)) {
++            if (hparams.n_pos_per_embd() > 1) {
++                auto ext = cells.ext_get(i);
++                // Only broadcast text coordinates are supported by this opt-in.
++                GGML_ASSERT(ext.x == cells.pos_get(i) && ext.y == cells.pos_get(i));
++                ext.x += shift;
++                ext.y += shift;
++                cells.ext_set(i, ext);
++            }
+             if (cells.pos_add(i, shift)) {
+                 if (new_head == cells.size()) {
+                     new_head = i;
+@@ -1174,7 +1182,10 @@
+         return false;
+     }
+     if (hparams.n_pos_per_embd() > 1) {
+-        return false;
++        // Text-only Qwen35 broadcasts the scalar position to all M-RoPE axes.
++        // In that restricted case the existing NEOX K-shift is applicable.
++        const char * text_shift = getenv("VCORTEX_QWEN35_TEXT_SHIFT");
++        return model.arch == LLM_ARCH_QWEN35 && text_shift && strcmp(text_shift, "1") == 0;
+     }
+     return true;
+ }
