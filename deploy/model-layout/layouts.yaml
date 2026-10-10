@@ -16,6 +16,8 @@ nodes:
     - stt-gigaam
     - bge-m3
     - qwen3.8-flash-next-iq4-xs-ring
+    - flash-next-strata
+    - flash-next-strata-ring
     routes:
       flash:
         gemma4-26b-heretic:
@@ -95,7 +97,17 @@ nodes:
     - ~/project/models/stt-gigaam/huggingface-cache/models--ai-sage--GigaAM-v3/snapshots/7655ad717f8122257385bb4b2f373db3697e8680/pytorch_model.bin
     - ~/project/models/stt-gigaam/huggingface-cache/models--ai-sage--GigaAM-v3/snapshots/7655ad717f8122257385bb4b2f373db3697e8680/tokenizer.model
     - /home/mirmik/project/vcortex/llama-ring/scripts/serve.py
-    - /home/mirmik/project/vcortex/llama-ring/build-qwen4/bin/llama-shadow-worker
+    - /home/mirmik/project/vcortex/llama-ring/build-qsa-mtp/bin/llama-shadow-worker
+    - /home/mirmik/project/vcortex/strata-ring/serve.py
+    - /home/mirmik/project/vcortex/strata-ring/config/plain.json
+    - /home/mirmik/project/vcortex/strata-ring/config/local.json
+    - /home/mirmik/project/vcortex/.deps/strata-v0.1.40/serve/server.py
+    - /home/mirmik/project/vcortex/.deps/strata-v0.1.40/build-halo/strata
+    - /home/mirmik/project/vcortex/.deps/strata-ring/build-halo/strata
+    - /home/mirmik/project/vcortex/.deps/strata-vision-cpu/bin/strata-vision
+    - /home/mirmik/project/vcortex/.deps/strata-data/iq4-xs/tokenizer
+    - /home/mirmik/project/vcortex/.deps/strata-data/mtp-rt
+    - /home/mirmik/project/vcortex/.deps/rocm7141/install/lib/libamdhip64.so
     api_url: https://192.168.0.61:8090
     python_checks:
     - python: ~/project/models/stt-gigaam/venv/bin/python
@@ -112,6 +124,9 @@ nodes:
       modules:
       - aiohttp
       - PIL
+      - jinja2
+      - regex
+      - numpy
     removed_routes:
     - bge-m3
     additions:
@@ -125,13 +140,37 @@ nodes:
         context: 262144
         startup_timeout: 900
         command: env GGML_VK_DISABLE_MMVQ=1 {python} /home/mirmik/project/vcortex/llama-ring/scripts/serve.py
-          --worker /home/mirmik/project/vcortex/llama-ring/build-qwen4/bin/llama-shadow-worker
+          --worker /home/mirmik/project/vcortex/llama-ring/build-qsa-mtp/bin/llama-shadow-worker
           --model /home/mirmik/project/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
           --mmproj /home/mirmik/project/models/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf
           --model-name {name} --host 127.0.0.1 --port {port} --context 262144 --prefix
           24576 --max-summary 8192 --max-output 32768 --max-sessions {slots} --quantum
           256 --trigger .7 --cache-type q8_0 --ram-rotation 1 --mtp-draft 0 --timeout
           1800 --slot-save-path {runtime_kv}
+      flash-next-strata:
+        driver: llama_cpp
+        gpu: local
+        autoload: false
+        on_demand: false
+        port: 18201
+        slots: 1
+        context: 262144
+        startup_timeout: 900
+        command: '{python} /home/mirmik/project/vcortex/.deps/strata-v0.1.40/serve/server.py
+          --engine strata --config /home/mirmik/project/vcortex/strata-ring/config/plain.json
+          --host 127.0.0.1 --port {port} --slot-save-path {runtime_kv}'
+      flash-next-strata-ring:
+        driver: llama_cpp
+        gpu: local
+        autoload: false
+        on_demand: false
+        port: 18200
+        slots: 2
+        context: 262144
+        startup_timeout: 900
+        command: '{python} /home/mirmik/project/vcortex/strata-ring/serve.py --config
+          /home/mirmik/project/vcortex/strata-ring/config/local.json --host 127.0.0.1
+          --port {port} --model-name {name} --slot-save-path {runtime_kv}'
     inference_settings:
       flash:
         request_timeout_seconds: null
@@ -354,19 +393,19 @@ nodes:
     tasks_url: http://127.0.0.1:9090/v1/tasks
     characters:
       atom:
-        flash: model-atom-flash-test
+        flash: model-flash-strata
         27b: model-atom
-        flash-ring: model-flash-ring
+        flash-ring: model-flash-strata-ring
         27b-ring: model-27b-ring
       atom-subagent:
-        flash: model-atom-flash-test
+        flash: model-flash-strata
         27b: model-atom
-        flash-ring: model-flash-ring
+        flash-ring: model-flash-strata-ring
         27b-ring: model-27b-ring
       tet:
-        flash: model-atom-flash-test
+        flash: model-flash-strata
         27b: model-tet
-        flash-ring: model-flash-ring
+        flash-ring: model-flash-strata-ring
         27b-ring: model-27b-ring
     expected_profiles:
       model-atom:
@@ -384,22 +423,28 @@ nodes:
       model-27b-ring:
         server: https://192.168.0.173:8080
         model: qwen3.8-27b-uncensored-q4-mtp-ring
+      model-flash-strata:
+        server: https://192.168.0.61:8090
+        model: flash-next-strata
+      model-flash-strata-ring:
+        server: https://192.168.0.61:8090
+        model: flash-next-strata-ring
     character_settings:
       flash:
         atom:
           context_management: null
           send_session_id: true
-          context_size: 131072
+          context_size: 262144
           request_timeout: 600
         atom-subagent:
           context_management: null
           send_session_id: true
-          context_size: 131072
+          context_size: 262144
           request_timeout: 600
         tet:
           context_management: null
           send_session_id: true
-          context_size: 131072
+          context_size: 262144
           request_timeout: null
       27b:
         atom:
@@ -452,7 +497,7 @@ nodes:
 modes:
   flash:
     aurora:
-    - qwen3.8-flash-next-iq4-xs
+    - flash-next-strata
     gpu173:
     - gemma4-26b-heretic
     - stt-gigaam
@@ -464,7 +509,7 @@ modes:
     - qwen3.8-27b-uncensored-q4-mtp
   flash-ring:
     aurora:
-    - qwen3.8-flash-next-iq4-xs-ring
+    - flash-next-strata-ring
     gpu173:
     - gemma4-26b-heretic
     - stt-gigaam

@@ -32,9 +32,9 @@ model-layout recover
 
 | Режим | Aurora .61 | GPU .173 |
 |---|---|---|
-| flash | qwen3.8-flash-next-iq4-xs | gemma4-26b-heretic, stt-gigaam |
+| flash | flash-next-strata | gemma4-26b-heretic, stt-gigaam |
 | 27b | gemma4-26b-heretic, stt-gigaam | qwen3.8-27b-uncensored-q4-mtp |
-| flash-ring | qwen3.8-flash-next-iq4-xs-ring | gemma4-26b-heretic, stt-gigaam |
+| flash-ring | flash-next-strata-ring | gemma4-26b-heretic, stt-gigaam |
 | 27b-ring | gemma4-26b-heretic, stt-gigaam | qwen3.8-27b-uncensored-q4-mtp-ring |
 
 Конфигурация включает определения недостающих runtime ring, Gemma и GigaAM.
@@ -70,15 +70,15 @@ HTTPS-прокси .173 с существующим `hosts.remote-173`. Марш
 
 | Персонаж | 27b | flash |
 |---|---|---|
-| atom | model-atom | model-atom-flash-test |
-| atom-subagent | model-atom | model-atom-flash-test |
-| tet | model-tet | model-atom-flash-test |
+| atom | model-atom | model-flash-strata |
+| atom-subagent | model-atom | model-flash-strata |
+| tet | model-tet | model-flash-strata |
 
-В `flash-ring` все три персонажа используют `model-flash-ring`, в `27b-ring` —
+В `flash-ring` все три персонажа используют `model-flash-strata-ring`, в `27b-ring` —
 `model-27b-ring`. `nodes.nemor.character_settings` переключает вместе с профилем:
 
 - ring: `context_management=runner`, `send_session_id=true`, timeout 1800 s;
-  размер окна 262144 у Flash и 114688 у 27B;
+  размер окна 131072 у Flash Strata и 114688 у 27B;
 - обычные режимы: клиентское управление контекстом (поле `context_management`
   удаляется), окно 131072, timeout 600 s у Atom/подагента и штатный у Tet.
 
@@ -161,12 +161,18 @@ Gemma с параметрами Aurora `-b 2048 -ub 2048` заняла почт�
 ## Установка ring-профилей
 
 Исходники установленной утилиты сохранены в `llama-ring/deploy/model-layout/`.
-Обычные режимы `flash` и `27b` сохраняют исходные модели и раскладку устройств.
+Режимы `flash` и `flash-ring` используют Strata; раскладка устройств и режимы 27B сохранены.
 Новые aliases используют собственный `{runtime_kv}`; native checkpoints к ring
-не подключаются. Порт ring на каждом GPU-хосте — 18198 (loopback).
+не подключаются. Порты на Aurora: Strata plain 18201, Strata ring 18200; на .173 ring — 18198 (loopback).
 
-- Flash: Aurora, `build-qwen4`, IQ4_XS + mmproj-F16, Q8 KV, P24576,
-  summary8192, max-output32768, MTP0, `GGML_VK_DISABLE_MMVQ=1`.
+- Flash plain: upstream Strata v0.1.40 HTTP server, IQ4_XS, INT8 KV, MTP4,
+  Cyrillic draft vocabulary, 128K, один слот. Компактизацией управляет Nemor.
+- Flash ring: наш native Strata runner, те же веса/KV/MTP, 128K, два RAM-слота,
+  trigger98304, keep65536, summary512. Поддерживает text/tools, фоновые summary,
+  `context_state` и атомарные KV checkpoints через llm-proxy.
+  Изображения пока не поддерживаются в обоих новых профилях; старые llama.cpp
+  runtime и их KV-кэш сохранены отдельно. Длинный диалог с изображениями нельзя
+  автоматически перенести в Strata вместе с прежним KV.
 - 27B: .173, существующая CUDA-сборка `~/project/llama-ring-vision-20261008`,
   Q4_K_M + vision-f16, Q8 KV, P24576, summary8192, max-output16000,
   MTP3, CPU projector с image-max-tokens1024. Окно 114688 соответствует
@@ -194,3 +200,25 @@ Runtime добавляются в proxy-конфигурации при перв
 четыре режима, no-op, read-only plan, обратное переключение настроек, полный
 rollback и отказ затирать посторонние правки. На трёх реальных узлах проверен
 preflight. Полный цикл загрузки GPU через новые режимы этой проверкой не выполнялся.
+
+## Переход Flash на Strata (2026-10-10)
+
+Runtime `flash-next-strata` и `flash-next-strata-ring` зарегистрированы отдельно,
+с `autoload=false`, `on_demand=false` до явного переключения. Их определения
+хранятся также в `vcortex/strata-ring/deploy/`. Новые Nemor profiles
+`model-flash-strata` и `model-flash-strata-ring` клонируют авторизацию существующего
+Flash profile на самом узле .76. Старые profiles не перезаписываются.
+
+`model-layout switch flash` запускает обычную Strata; `model-layout switch flash-ring`
+запускает Strata с нашей компактизацией. Старые Flash runtime остаются в `managed`,
+поэтому переключатель останавливает их и отключает автоматический запуск.
+Изменение конфигурации режимов само по себе не перезапускает текущую сессию Nemor.
+
+Оба Strata-профиля теперь включают изображения: CPU `strata-vision` +
+`mmproj-F16.gguf`, до 1024 visual tokens на картинку. Ring сохраняет embeddings
+в checkpoint и учитывает M-RoPE при кольцевом сжатии. Проверка —
+`vcortex/experiments/064-strata-vision.md`.
+
+2026-10-11: Strata flash/flash-ring возвращены на единое окно 262144 токена,
+как у прежнего Flash-профиля. В Strata удалён отдельный лимит длины резюме;
+вставляется только его текст. Старые 128K KV-checkpoints сохранены отдельно.

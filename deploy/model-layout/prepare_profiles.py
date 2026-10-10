@@ -7,6 +7,10 @@ from pathlib import Path
 
 
 PROFILES = {
+    'model-flash-strata': ('model-atom-flash-test', 'https://192.168.0.61:8090',
+                          'qwen3.8-flash-next-iq4-xs', 'flash-next-strata'),
+    'model-flash-strata-ring': ('model-atom-flash-test', 'https://192.168.0.61:8090',
+                               'qwen3.8-flash-next-iq4-xs', 'flash-next-strata-ring'),
     'model-flash-ring': ('model-atom-flash-test', 'https://192.168.0.61:8090',
                          'qwen3.8-flash-next-iq4-xs', 'qwen3.8-flash-next-iq4-xs-ring'),
     'model-27b-ring': ('model-atom', 'https://192.168.0.173:8080',

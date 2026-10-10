@@ -104,7 +104,7 @@ void Shadow::advance() {
             }
             auto text = current["summary"].get<std::string>();
             require(!text.empty(), "Empty shadow summary");
-            candidate = prefix_builder ? prefix_builder(text) : model.tokens(message("system", base + (text == "NONE" ? "" : "\n\nПамять:\n" + text)));
+            candidate = prefix_builder ? prefix_builder(text) : model.tokens(message("system", base + (base.empty() ? "" : "\n\n") + text));
             require(candidate.size() <= size_t(stream.prefix_limit), "Shadow prefix overflow; old memory preserved");
             // Release the frozen archive before reserving candidate P cells.
             stream.ctx.remove(4);
