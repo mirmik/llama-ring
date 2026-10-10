@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ring {
@@ -17,10 +18,21 @@ std::string trim(std::string text) {
 std::string message(const std::string & role, const std::string & text) {
     return "<|im_start|>" + role + "\n" + text + "<|im_end|>\n";
 }
-Model::Model(const std::string & path, int gpu_layers, const std::string & cache, int draft) : mtp_draft(draft) {
+Model::Model(const std::string & path, int gpu_layers, const std::string & cache, int draft, const std::string & mtp_path) : mtp_draft(draft) {
+    require(mtp_path.empty() || draft > 0, "--mtp-model requires --mtp-draft > 0");
     require(draft >= 0 && draft <= 8, "MTP draft count must be between 0 and 8");
     require(cache == "f16" || cache == "q8_0", "Cache type must be f16 or q8_0");
     cache_type = cache == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    // Vulkan's automatic MMVQ policy switches activation precision between
+    // single-token decode and verifier batches. With Q8 KV this exceeds the
+    // measured MTP error envelope. Choose the floating-input path before device
+    // initialization; leave other modes and explicit backend overrides alone.
+    const char * mtp_auto = std::getenv("VCORTEX_MTP_VULKAN_AUTO");
+    if (draft > 0 && gpu_layers > 0 && cache == "q8_0" && !(mtp_auto && std::string(mtp_auto) == "1") &&
+        !std::getenv("GGML_VK_FORCE_MMVQ") && !std::getenv("GGML_VK_DISABLE_MMVQ")) {
+        require(setenv("GGML_VK_DISABLE_MMVQ", "1", 0) == 0, "Cannot configure Vulkan MTP precision");
+        std::fprintf(stderr, "llama-ring: disabling Vulkan MMVQ for Q8 MTP batch consistency\n");
+    }
     ggml_backend_load_all();
     if (gpu_layers > 0) {
         bool gpu = false;
@@ -32,6 +44,9 @@ Model::Model(const std::string & path, int gpu_layers, const std::string & cache
     }
     auto params = llama_model_default_params();
     params.n_gpu_layers = gpu_layers;
+    params.load_mtp = draft > 0 && mtp_path.empty();
+    // Keep architecture-marked lookup tables lazy even on integrated GPUs.
+    params.lazy_mode = LLAMA_LAZY_MODE_ON;
     ptr.reset(llama_model_load_from_file(path.c_str(), params));
     require(bool(ptr), "Cannot load model: " + path);
     char arch[128] = {};
@@ -40,10 +55,31 @@ Model::Model(const std::string & path, int gpu_layers, const std::string & cache
     char model_name[256] = {};
     llama_model_meta_val_str(ptr.get(), "general.name", model_name, sizeof(model_name));
     name = model_name;
-    hybrid = architecture == "qwen35";
-    require(!draft || (hybrid && llama_model_n_layer_nextn(ptr.get()) == 1), "MTP requires qwen35 with one NextN head");
+    indexed = architecture == "qwen4exp";
+    hybrid = architecture == "qwen35" || indexed;
+    if (!mtp_path.empty()) {
+        require(indexed, "Separate MTP models currently require qwen4exp");
+        params.load_mtp = true;
+        mtp_model.reset(llama_model_load_from_file(mtp_path.c_str(), params));
+        require(bool(mtp_model), "Cannot load MTP model: " + mtp_path);
+        char draft_arch[128] = {};
+        llama_model_meta_val_str(mtp_model.get(), "general.architecture", draft_arch, sizeof(draft_arch));
+        require(architecture == draft_arch && llama_model_n_embd(ptr.get()) == llama_model_n_embd(mtp_model.get()) &&
+                llama_model_n_embd_out(ptr.get()) == llama_model_n_embd_out(mtp_model.get()),
+                "MTP architecture/embedding width differs from target");
+        const auto * target_vocab = llama_model_get_vocab(ptr.get());
+        const auto * draft_vocab = llama_model_get_vocab(mtp_model.get());
+        require(llama_vocab_n_tokens(target_vocab) == llama_vocab_n_tokens(draft_vocab), "MTP vocabulary size differs");
+        for (int i = 0; i < llama_vocab_n_tokens(target_vocab); ++i) {
+            require(std::string(llama_vocab_get_text(target_vocab, i)) == llama_vocab_get_text(draft_vocab, i) &&
+                    llama_vocab_get_attr(target_vocab, i) == llama_vocab_get_attr(draft_vocab, i), "MTP vocabulary differs");
+        }
+    }
+    require(!draft || (hybrid && llama_model_n_layer_nextn(mtp_model ? mtp_model.get() : ptr.get()) == 1),
+            "MTP requires one NextN head; Flash-Next needs --mtp-model pointing to a compatible head");
     setenv("VCORTEX_QWEN35_TEXT_SHIFT", hybrid ? "1" : "0", 1);
-    require(architecture == "qwen3" || hybrid, "Supported architectures: qwen3 / qwen35");
+    setenv("VCORTEX_QWEN4_RING", indexed ? "1" : "0", 1);
+    require(architecture == "qwen3" || hybrid, "Supported architectures: qwen3 / qwen35 / qwen4exp");
     vocab = llama_model_get_vocab(ptr.get());
 }
 std::string Model::generation_prompt() const {
@@ -119,7 +155,7 @@ void Context::park() {
     // Remove only this branch's membership of shared cells. Main retains them.
     // Serialization then transfers private KV and the recurrent tail only.
     if (branch.shared_end > 0)
-        require(llama_memory_seq_rm(attention_memory(),1,0,branch.shared_end), "Cannot detach shared KV");
+        require(llama_memory_attention_seq_rm(memory(),1,0,branch.shared_end), "Cannot detach shared KV");
     try {
         std::vector<uint8_t> bytes(llama_state_seq_get_size(ptr.get(),1));
         require(llama_state_seq_get_data(ptr.get(),bytes.data(),bytes.size(),1)==bytes.size(), "RAM export failed");
@@ -127,7 +163,7 @@ void Context::park() {
         branch.bytes = std::move(bytes);
     } catch (...) {
         // Export allocation/serialization failure leaves the resident state usable.
-        if (branch.shared_end > 0) llama_memory_seq_cp(attention_memory(),0,1,0,branch.shared_end);
+        if (branch.shared_end > 0) llama_memory_attention_seq_cp(memory(),0,1,0,branch.shared_end);
         throw;
     }
     ++exports; export_bytes += branch.bytes.size(); export_s += seconds(start);
@@ -154,7 +190,7 @@ int Context::physical(int seq) {
         ++imports; import_bytes += branch.bytes.size(); import_s += seconds(start);
         std::vector<uint8_t>().swap(branch.bytes);
     }
-    if (branch.shared_end > 0) llama_memory_seq_cp(attention_memory(),0,1,0,branch.shared_end);
+    if (branch.shared_end > 0) llama_memory_attention_seq_cp(memory(),0,1,0,branch.shared_end);
     resident = seq;
     return 1;
 }
@@ -184,8 +220,14 @@ void Context::copy(int src, int dst, int from, int to) {
         require(src == 0 && dst > 0 && dst < 5 && from <= 0, "RAM branches must fork main from zero");
         remove(dst);
         int target = physical(dst);
-        llama_memory_seq_cp(memory(),0,target,from,to);
+        if (model.indexed) {
+            llama_memory_attention_seq_cp(memory(),0,target,from,to);
+            llama_memory_seq_cp(recurrent_memory(),0,target,-1,-1);
+        } else llama_memory_seq_cp(memory(),0,target,from,to);
         share_prefix(dst,to < 0 ? llama_memory_seq_pos_max(attention_memory(),0)+1 : to);
+    } else if (model.indexed) {
+        llama_memory_attention_seq_cp(memory(),src,dst,from,to);
+        llama_memory_seq_cp(recurrent_memory(),src,dst,-1,-1);
     } else llama_memory_seq_cp(memory(),src,dst,from,to);
 }
 void Context::decode(const Tokens & ids, int position, int seq, bool want_logits) {
@@ -294,7 +336,7 @@ double Stream::append_prefix(const Tokens & ids) {
         // Sequence 3 preserves the independent prefix recurrence. Decoding a
         // prefix addition on sequence 0 would consume/overwrite A's latest state.
         ctx.decode(ids, prefix.size(), 3);
-        llama_memory_seq_cp(ctx.attention_memory(), ctx.physical(3), 0, prefix.size(), prefix.size() + ids.size());
+        llama_memory_attention_seq_cp(ctx.memory(), ctx.physical(3), 0, prefix.size(), prefix.size() + ids.size());
         ctx.share_prefix(3, prefix.size() + ids.size());
         if (!started) {
             // Initial P: seed the stream recurrence. Later P additions must
@@ -342,8 +384,8 @@ double Stream::evict(int count) {
             "Cannot rebase history borrowed by a RAM branch");
     require(count > 0 && size_t(count) <= active.size(), "Invalid eviction count");
     auto start = Clock::now();
-    require(llama_memory_seq_rm(ctx.attention_memory(), 0, prefix_capacity, prefix_capacity + distance), "Attention eviction failed");
-    llama_memory_seq_add(ctx.attention_memory(), 0, prefix_capacity + distance, -1, -distance);
+    require(llama_memory_attention_seq_rm(ctx.memory(), 0, prefix_capacity, prefix_capacity + distance), "Attention eviction failed");
+    llama_memory_attention_seq_add(ctx.memory(), 0, prefix_capacity + distance, -1, -distance);
     if (ctx.model.hybrid) {
         // The recurrent tail must move even when *all* active attention cells
         // were evicted. Its tensor history is retained, its position is rebased.
@@ -371,13 +413,13 @@ double Stream::replace_prefix_from(int sequence, const Tokens & ids, int evict_c
             "Prepared prefix recurrent tail mismatch");
     auto start = Clock::now();
     llama_synchronize(ctx.ptr.get());
-    require(llama_memory_seq_rm(ctx.attention_memory(), 0, 0, prefix_capacity), "Old prefix removal failed");
+    require(llama_memory_attention_seq_rm(ctx.memory(), 0, 0, prefix_capacity), "Old prefix removal failed");
     if(flexible) {
         // Remove old P and the cut before moving the tail, so a growing or
         // shrinking prefix cannot alias either removal range.
-        require(llama_memory_seq_rm(ctx.attention_memory(),0,prefix_capacity,prefix_capacity+distance),"Attention eviction failed");
+        require(llama_memory_attention_seq_rm(ctx.memory(),0,prefix_capacity,prefix_capacity+distance),"Attention eviction failed");
         const int delta=int(ids.size())-prefix_capacity-distance;
-        llama_memory_seq_add(ctx.attention_memory(),0,prefix_capacity+distance,-1,delta);
+        llama_memory_attention_seq_add(ctx.memory(),0,prefix_capacity+distance,-1,delta);
         if(ctx.model.hybrid) {
             const int shift = size_t(evict_count)==active.size()
                 ? int(ids.size())-1-llama_memory_seq_pos_max(ctx.recurrent_memory(),0) : delta;
@@ -389,13 +431,13 @@ double Stream::replace_prefix_from(int sequence, const Tokens & ids, int evict_c
     if (ctx.ram_rotation) {
         // Candidate becomes the independently appendable prefix. Its attention
         // is now shared with main; its recurrence stays separate in host memory.
-        llama_memory_seq_cp(ctx.attention_memory(),native,0,0,ids.size());
+        llama_memory_attention_seq_cp(ctx.memory(),native,0,0,ids.size());
         ctx.rename_branch(sequence,3);
         ctx.share_prefix(3,ids.size());
     } else if (ctx.model.hybrid) {
         ctx.remove(3);
         ctx.copy(sequence, 3);
-        llama_memory_seq_cp(ctx.attention_memory(), sequence, 0, 0, ids.size());
+        llama_memory_attention_seq_cp(ctx.memory(), sequence, 0, 0, ids.size());
     } else {
         ctx.copy(sequence, 0, 0, ids.size());
     }

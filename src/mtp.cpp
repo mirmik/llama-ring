@@ -16,7 +16,7 @@ MtpAnswer::MtpAnswer(Context & ctx, int capacity) : target(ctx), seq(ctx.physica
     p.n_threads = p.n_threads_batch = 8;
     p.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     p.type_k = p.type_v = ctx.model.cache_type;
-    draft.reset(llama_init_from_model(ctx.model.ptr.get(), p));
+    draft.reset(llama_init_from_model(ctx.model.mtp_model ? ctx.model.mtp_model.get() : ctx.model.ptr.get(), p));
     require(bool(draft), "Cannot create MTP context");
     common_params_speculative params;
     params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
@@ -44,7 +44,9 @@ void MtpAnswer::decode(const Tokens & tokens, int position, bool all_logits) {
         require(llama_decode(target.ptr.get(), batch) == 0, "MTP target decode failed");
         // Discard speculative head KV before teacher-forcing target hidden rows.
         require(llama_memory_seq_rm(llama_get_memory(draft.get()), seq, position, -1), "MTP draft trim failed");
-        require(common_speculative_process(spec.get(), batch), "MTP hidden-state update failed");
+        common_batch processed(target.ptr.get());
+        for (int i = 0; i < batch.n_tokens; ++i) processed.add(batch.token[i], batch.pos[i], seq, batch.logits[i]);
+        require(common_speculative_process(spec.get(), processed), "MTP hidden-state update failed");
     } catch (...) { llama_batch_free(batch); throw; }
     llama_batch_free(batch);
 }
@@ -54,7 +56,7 @@ Tokens MtpAnswer::next(common_sampler * sampler, llama_token last, int & positio
     Tokens proposal;
     auto & dp = common_speculative_get_draft_params(spec.get(), seq);
     dp.drafting = true; dp.n_max = std::min(n_max, remaining - 1);
-    dp.n_past = position; dp.id_last = last; dp.result = &proposal; dp.prompt = nullptr;
+    dp.pos0 = position; dp.id_last = last; dp.result = &proposal; dp.prompt = nullptr;
     if (dp.n_max > 0) common_speculative_draft(spec.get());
     else dp.drafting = false;
     // Enforce the output budget even if a driver ignores the per-sequence cap.
@@ -72,6 +74,7 @@ Tokens MtpAnswer::next(common_sampler * sampler, llama_token last, int & positio
         ++matched;
     }
     common_speculative_accept(spec.get(), seq, result.size() - 1);
+    if (observe_verification) observe_verification(verification,result.size());
     const int keep = position + result.size();
     require(llama_memory_seq_rm(target.memory(), seq, keep, -1), "MTP target rollback failed");
     require(llama_memory_seq_rm(llama_get_memory(draft.get()), seq, keep, -1), "MTP draft rollback failed");

@@ -7,6 +7,9 @@
 
 namespace ring {
 static const std::string instruction = "Суммаризируй предыдущий текст.";
+static const std::string indexed_instruction =
+    "Сейчас составь краткое связное резюме всего предыдущего диалога для продолжения разговора. "
+    "Выведи только резюме, без подтверждения выполнения.";
 static int trigger_tokens(double trigger, int capacity) {
     require(std::isfinite(trigger) && trigger > 0 && trigger < 1, "Invalid trigger");
     int value = int(std::ceil(trigger * capacity));
@@ -55,8 +58,10 @@ bool Shadow::start_if_due(bool force) {
     // The cut may be inside a user/tool/assistant message. Close that message,
     // then switch the cached conversation into an internal summarization task.
     // No archive is rendered/tokenized again: seq4 sees exactly the frozen P+A.
-    prompt = model.tokens("<|im_end|>\n" + message("system",
-        instruction_override.empty() ? instruction : instruction_override) + model.generation_prompt());
+    // Flash-Next also ignores the terse mid-dialogue system request in a fresh
+    // upstream context. Use an explicit user task; preserve custom instructions.
+    prompt = model.tokens("<|im_end|>\n" + message(model.indexed ? "user" : "system",
+        instruction_override.empty() ? (model.indexed ? indexed_instruction : instruction) : instruction_override) + model.generation_prompt());
     require(prompt.size() <= suffix_capacity, "Summary instruction exceeds suffix reserve");
     stream.ctx.remove(2);
     stream.ctx.remove(4);

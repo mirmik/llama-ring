@@ -18,6 +18,7 @@ class MtpAnswer {
 public:
     // Optional read-only numerical oracle for tests; never set by the server.
     std::function<void(const float *)> observe_logits;
+    std::function<void(const Tokens &, int)> observe_verification;
     MtpAnswer(Context & target, int capacity);
     ~MtpAnswer();
     void prefill(const Tokens & suffix, int position);

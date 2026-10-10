@@ -35,7 +35,75 @@ logits are checked with KL bounds and an independent batching control; exact
 greedy equality is reported separately. Do not interpret a passing test as
 bitwise equivalence for arbitrary hardware or prompts.
 
+The MTP probe also accepts GPU layers and cache type:
+`llama-mtp-test MODEL 3 0 q8_0` (CPU), or `MODEL 3 99 f16` (GPU/f16).
+`VCORTEX_MTP_DIAGNOSTIC=1` records per-token KL and replays the exact verifier
+batches without an MTP head, separately controlling hidden-state export and
+rejected-token rollback. `VCORTEX_MTP_INITIAL_ONLY=1` limits that diagnostic
+to the initial case and labels its output accordingly; omit it for the full
+eight-case acceptance check.
+
+For a negative control of the Vulkan Q8 workaround,
+`VCORTEX_MTP_VULKAN_AUTO=1` retains the backend's original automatic MMVQ
+selection (with both `GGML_VK_FORCE_MMVQ` and `GGML_VK_DISABLE_MMVQ` unset).
+This reproduces the failing numerical case on the tested Radeon 8060S. Normal
+Q8 MTP runs select the floating-input path; model weights and KV remain quantized.
+
 ## Synthetic streaming CLIs
+
+For Flash-Next, run the QSA probe before a streaming experiment:
+
+```bash
+build/bin/llama-qsa-test /path/to/first-shard.gguf 99 f16 2208 baseline
+build/bin/llama-qsa-test /path/to/first-shard.gguf 99 q8_0 2208 memory
+```
+
+The baseline compares ordinary upstream pooling with ring pooling on the same
+weights, prompt and teacher-forced continuation. The memory mode also checks
+different batch partitions, uniform shifts, branches with different QSA block
+boundaries, native disk restoration, RAM branch export/import and ten prepared
+prefix replacements with growing/shrinking prefixes and full active eviction.
+Using more than 2048 prompt tokens exercises sparse selection. The prepared
+prefix test supplies a known fact; it does not test the quality of generated
+summaries. Use the streaming CLI for that separate experiment.
+
+To compare the sequence-private QSA cache with the previous ring implementation,
+set `VCORTEX_QSA_REFERENCE_RING=1` for the QSA probe. It creates the reference
+with `VCORTEX_QSA_CACHE=0` and the tested contexts with caching enabled.
+
+Flash-Next MTP and the three-arm decode benchmark use a separate head:
+
+```bash
+GGML_VK_DISABLE_MMVQ=1 build/bin/llama-mtp-test TARGET 3 99 q8_0 MTP_HEAD
+GGML_VK_DISABLE_MMVQ=1 build/bin/llama-qsa-mtp-bench TARGET MTP_HEAD 16000 256
+GGML_VK_DISABLE_MMVQ=1 build/bin/llama-qsa-mtp-bench TARGET MTP_HEAD 16000 256 oracle
+```
+
+The MTP test includes checkpoint migration with draft counts 0 → 3 → 0.
+The benchmark reports history prefill, suffix preparation, decode tokens/s and
+draft acceptance separately for code and Russian prose. The optional `oracle`
+mode runs only the MTP arm, traces its logits, and teacher-forces the same tokens
+through independent serial and four-token target decoders. It checks the same
+numerical envelope as the MTP regression test. Tracing changes timings: keep
+oracle runs separate from throughput measurements. Greedy free-running texts
+need not remain identical when serial and batched numerical rounding differs.
+Every oracle arm clears memory and restores the same main snapshot before
+forking: deleting the answer branch alone can change physical KV placement and
+confound the numerical comparison. The main snapshot must remain byte-identical
+after MTP. Use `diagnostic` instead of `oracle` to also replay the exact verifier
+batches, independently toggling hidden-state export and rejected-token rollback.
+Diagnostic mode reports failures without failing the process; inspect its
+`oracle.passed` fields. Ordinary `oracle` mode exits nonzero on a failed bound.
+
+`llama-qsa-test MODEL 99 q8_0 717 summary fixture.json` records three summary
+requests against both a cached branch with a fixed P/A gap and a fresh contiguous
+upstream context. The fixture uses the streaming CLI schema. This diagnostic
+reports generated text and logits; it does not assert summary quality or
+equivalence between different position layouts.
+
+On shared-memory GPUs, monitor system available RAM as well as process/cgroup
+memory: device allocations may not be included in the cgroup's memory counter.
+Lazy PLE avoids eager loading of that table but is not a whole-model memory cap.
 
 ```bash
 python scripts/make_fixture.py --out runs/fixture.json
@@ -59,6 +127,11 @@ not guaranteed by general summarization; `--allow-recall-miss` records misses
 separately from mechanical checks.
 
 ## MemoryAgentBench pilot
+
+When preparing a Flash-Next fixture, pass `--architecture qwen4exp` to
+`scripts/memory_bench.py prepare`. The helper reads the architecture's current
+summary instruction from `src/shadow.cpp` and records its source hash. The
+default remains `qwen35` for the existing pilot protocol.
 
 `scripts/memory_bench.py` prepares a selected, pinned pilot and scores
 `llama-memory-bench` output. This is an adapted streaming protocol, not an

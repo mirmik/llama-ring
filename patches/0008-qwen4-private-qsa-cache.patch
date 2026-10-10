@@ -1,0 +1,219 @@
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -51,6 +51,7 @@
+         filter_attn, filter_recr),
+     ring_pool(model.arch == LLM_ARCH_QWEN4EXP && getenv("VCORTEX_QWEN4_RING") != nullptr &&
+               strcmp(getenv("VCORTEX_QWEN4_RING"), "1") == 0),
++    ring_cache(ring_pool && model.hparams.indexer_kpool > 0 && (getenv("VCORTEX_QSA_CACHE") == nullptr || strcmp(getenv("VCORTEX_QSA_CACHE"), "0") != 0)),
+     hparams_idx(model.hparams),
+     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+@@ -73,7 +74,36 @@
+             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+             nullptr, filter_idx, nullptr, nullptr, "idx_");
+-    }()) {}
++    }()) {
++    if (ring_cache && mem_idx) {
++        // Derived data is deliberately separate from serialized KV state. Partial
++        // branches may share raw cells but group them into different blocks.
++        // A fixed per-sequence stride keeps old pool indices stable on append.
++        const int64_t slots = int64_t(kv_size / get_kpool()) * n_seq_max + 1;
++        pool_storage.resize(model.hparams.n_layer_all, nullptr);
++        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
++            if (!filter_idx(il)) continue;
++            ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
++            ggml_context_ptr ctx(ggml_init(params));
++            if (!ctx) throw std::runtime_error("cannot allocate QSA pool metadata");
++            auto * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, model.hparams.indexer_head_size, slots);
++            ggml_format_name(tensor, "ring_qsa_pool_l%d", il);
++            auto buft = ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer);
++            ggml_backend_buffer_ptr buf(model.hparams.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
++                ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++            if (!buf) throw std::runtime_error("cannot allocate QSA pool cache");
++            if (model.hparams.no_alloc) tensor->buffer = buf.get();
++            else ggml_backend_buffer_clear(buf.get(), 0);
++            pool_storage[il] = tensor;
++            pool_buffers.emplace_back(std::move(ctx), std::move(buf));
++        }
++        LLAMA_LOG_INFO("%s: sequence-private F32 QSA pool cache, %lld slots/layer\n", __func__, (long long) slots);
++    }
++}
++
++ggml_tensor * llama_memory_hybrid_idx::ring_pool_storage(int32_t il) const {
++    return ring_cache ? pool_storage.at(il) : nullptr;
++}
+ 
+ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+@@ -273,6 +303,10 @@
+         }
+     }
+ 
++    for (const auto & entry : pool_buffers) {
++        auto buft = ggml_backend_buffer_get_type(entry.second.get());
++        mb[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(entry.first.get(), buft);
++    }
+     return mb;
+ }
+ 
+@@ -600,7 +634,7 @@
+     return ns_ubatch[i_cur];
+ }
+ 
+-llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd) : ctx(ctx) {
++llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * private_pool) : ctx(ctx) {
+     // rows are the per-token part (glm5-next: key | gate, qwen4exp: key), then the pooled key
+     const int64_t n_tok = k->ne[0] - n_embd;
+     GGML_ASSERT(n_tok > 0 && n_tok % n_embd == 0);
+@@ -610,7 +644,7 @@
+     // Pool indices can refer to other streams. Revisit these full-storage views if that changes:
+     // https://github.com/ggml-org/llama.cpp/pull/27773#discussion_r4130905603
+     key_gate = ggml_view_2d(ctx, k, n_tok,  n_cells, k->nb[1], 0);
+-    pooled   = ggml_view_2d(ctx, k, n_embd, n_cells, k->nb[1], ggml_row_size(k->type, n_tok));
++    pooled   = private_pool ? private_pool : ggml_view_2d(ctx, k, n_embd, n_cells, k->nb[1], ggml_row_size(k->type, n_tok));
+ }
+ 
+ ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_key_gate(ggml_tensor * idxs) const {
+@@ -629,7 +663,7 @@
+         ggml_context * ctx, int32_t il, int64_t n_embd) const {
+     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+ 
+-    return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd);
++    return kpool_access(ctx, mem->get_mem_idx()->get_k_storage(il), n_embd, mem->ring_pool_storage(il));
+ }
+ 
+ // k-pool DSA indexer (glm5-next, qwen4exp QSA)
+@@ -676,6 +710,11 @@
+     // a pool is marked once per rep: sequences sharing cells (a seq_cp, or tokens decoded for several sequences)
+     // share their pools, whose single pooled row they all read through pool_cells, so the scatter rows stay unique
+     auto mark = [&](llama_seq_id s, size_t k) {
++        if (mem->ring_pool_cache()) {
++            auto & flag = st.is_new[pool_start[s] + k];
++            if (flag != st.generation) { flag = st.generation; ++st.n_new; }
++            return;
++        }
+         const auto & sq  = lay.seqs[s];
+         const size_t rep = (size_t) sq.strm*kv_size + sq.cells[sq.pools[k] + kpool - 1].second;
+         if (st.rep_gen[rep] != st.generation) {
+@@ -740,7 +779,8 @@
+     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
+     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
+     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
+-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
++    st.n_new_g = mem->ring_pool_cache() ? std::max(st.n_new, 1u) :
++        std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+ }
+ 
+ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
+@@ -754,7 +794,7 @@
+ }
+ 
+ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
+-    return mem->ring_pooling() ? get_n_kpool() : kpool_cur().n_new_g;
++    return ring_pooling() ? get_n_kpool() : kpool_cur().n_new_g;
+ }
+ 
+ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+@@ -774,7 +814,7 @@
+ 
+     const uint32_t n_tokens = ubatch->n_tokens;
+     const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
+-    const uint32_t n_new    = mem->ring_pooling() ? st.n_pool_real : st.n_new;
++    const uint32_t n_new    = ring_pooling() ? st.n_pool_real : st.n_new;
+     // the graph always pools at least one entry, padded to a stable bound, see kpool_build_state
+     const uint32_t n_new_g  = get_n_kpool_new();
+ 
+@@ -879,18 +919,18 @@
+ 
+             // The pooled key lives in the last member's row.
+             const uint32_t rep = sq.cells[j + kpool - 1].second;
+-            pcell[ip] = (int32_t) gcell(sq, rep);
++            pcell[ip] = mem->ring_pool_cache() ? s*(kv_size/kpool) + pi : (int32_t) gcell(sq, rep);
+ 
+             for (uint32_t k = 0; k < kpool; ++k) {
+                 pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+             }
+ 
+-            if (mem->ring_pooling() || st.is_new[ip] == st.generation) {
++            if (ring_pooling() || st.is_new[ip] == st.generation) {
+                 GGML_ASSERT(i_new < n_new);
+                 for (uint32_t k = 0; k < kpool; ++k) {
+                     nidx[(size_t) i_new*kpool + k] = (int32_t) gcell(sq, sq.cells[j + k].second);
+                 }
+-                nrep[i_new] = gcell(sq, rep);
++                nrep[i_new] = pcell[ip];
+                 if (npos != nullptr) {
+                     // a pooled key is rotated to the M-RoPE position of its first member
+                     const uint32_t c = sq.cells[j].second;
+@@ -910,12 +950,18 @@
+ 
+     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
+     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
+-    if (mem->ring_pooling()) {
++    if (ring_pooling()) {
+         // No scatter in ring mode: padded rows may reuse any initialized raw key.
+         for (uint32_t i = n_new; i < n_new_g; ++i) {
+             std::fill(nidx + i*kpool, nidx + (i + 1)*kpool, (int32_t) dummy_cell);
+             nrep[i] = dummy_cell;
+         }
++    } else if (mem->ring_pool_cache()) {
++        // The single extra row is scratch for an ubatch completing no pool.
++        for (uint32_t i = n_new; i < n_new_g; ++i) {
++            std::fill(nidx + i*kpool, nidx + (i + 1)*kpool, (int32_t) dummy_cell);
++            nrep[i] = int64_t(kv_size/kpool)*mem->get_mem_idx()->get_n_seq_max();
++        }
+     } else if (n_new_g > n_new) {
+         std::vector<int64_t> reps(pcell, pcell + pool_end.size());
+         std::sort(reps.begin(), reps.end());
+@@ -935,7 +981,7 @@
+ 
+     const uint32_t n_pool_real = (uint32_t) pool_end.size();
+     for (uint32_t ip = n_pool_real; ip < n_pool; ++ip) {
+-        pcell[ip] = (int32_t) dummy_cell; // pool_cells always addresses the K storage
++        pcell[ip] = mem->ring_pool_cache() ? int64_t(kv_size/kpool)*mem->get_mem_idx()->get_n_seq_max() : dummy_cell;
+         for (uint32_t k = 0; k < kpool; ++k) {
+             pidx[(size_t) ip*kpool + k] = sentinel;
+         }
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -76,8 +76,10 @@
+     // llama_memory_hybrid_idx specific API
+     //
+ 
+-    // Ring mode computes pooled keys per graph, so partially shared sequences cannot alias them.
++    // Ring pools use sequence-private derived storage; VCORTEX_QSA_CACHE=0 selects full recomputation.
+     bool ring_pooling() const { return ring_pool; }
++    bool ring_pool_cache() const { return ring_cache; }
++    ggml_tensor * ring_pool_storage(int32_t il) const;
+     bool ring_attn_rm(llama_seq_id seq, llama_pos p0, llama_pos p1);
+     void ring_attn_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
+     void ring_attn_add(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos shift);
+@@ -121,6 +123,9 @@
+     // the indexer cache holds one key head per layer, so it needs its own hparams:
+     // llama_kv_cache keeps a reference to what it is given
+     const bool ring_pool;
++    const bool ring_cache;
++    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pool_buffers;
++    std::vector<ggml_tensor *> pool_storage;
+     llama_hparams hparams_idx;
+ 
+     const std::unique_ptr<llama_kv_cache> mem_idx;
+@@ -148,7 +153,7 @@
+     private:
+         friend class llama_memory_hybrid_idx_context;
+ 
+-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
++        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, ggml_tensor * private_pool);
+ 
+         ggml_context * ctx;
+         ggml_tensor  * key_gate;
+@@ -198,7 +203,7 @@
+     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
+     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+-    bool ring_pooling() const { return mem->ring_pooling(); }
++    bool ring_pooling() const { return mem->ring_pooling() && !mem->ring_pool_cache(); }
+     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
+     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time

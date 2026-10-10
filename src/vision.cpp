@@ -9,11 +9,12 @@
 namespace ring {
 Vision::Vision(Model & m, const std::string & projector, bool gpu, int max_tokens) : model(m) {
     if(projector.empty()) return;
-    require(model.hybrid,"Vision currently requires qwen35");
-    require(max_tokens>=64 && max_tokens<=4096,"image-max-tokens must be 64..4096");
+    require(model.architecture == "qwen35" || model.architecture == "qwen4exp","Vision requires qwen35 or qwen4exp");
+    require(max_tokens==-1 || (max_tokens>=64 && max_tokens<=32768),"image-max-tokens must be -1 (projector default) or 64..32768");
     auto params=mtmd_context_params_default();
     params.use_gpu=gpu;params.n_threads=8;params.warmup=false;
-    params.image_min_tokens=64;params.image_max_tokens=max_tokens;
+    // Preserve the projector's resolution limits unless explicitly overridden.
+    if(max_tokens>0) {params.image_min_tokens=64;params.image_max_tokens=max_tokens;}
     ctx.reset(mtmd_init_from_file(projector.c_str(),model.ptr.get(),params));
     require(bool(ctx) && mtmd_support_vision(ctx.get()) && mtmd_decode_use_mrope(ctx.get()),"Incompatible vision projector");
 }
@@ -22,13 +23,14 @@ VisionInput Vision::input(const json & messages) {
     for(auto & msg:out.messages) {
         if(!msg.contains("content") || !msg["content"].is_array()) continue;
         for(auto & part:msg["content"]) {
-            if(part.value("type",std::string())!="image_url") continue;
+            const auto type=part.value("type",std::string());
+            if(type!="image_url" && type!="input_video") continue;
             require(bool(ctx),"Vision disabled: configure --mmproj");
             require(msg.at("role")=="user","Images are supported in user messages only");
-            const auto url=part.at("image_url").at("url").get<std::string>();
+            const auto url=type=="image_url"?part.at("image_url").at("url").get<std::string>():part.at("input_video").at("data").get<std::string>();
             const auto comma=url.find(',');
-            require(comma!=std::string::npos && (url.substr(0,comma)=="data:image/png;base64" || url.substr(0,comma)=="data:image/jpeg;base64"),"Use inline PNG/JPEG data URLs");
-            const std::string encoded=url.substr(comma+1);
+            require(type=="input_video" || (comma!=std::string::npos && url.rfind("data:image/",0)==0 && url.substr(0,comma).find(";base64")!=std::string::npos),"Use inline base64 media");
+            const std::string encoded=comma==std::string::npos?url:url.substr(comma+1);
             require(!encoded.empty() && encoded.size()%4==0 && encoded.size()<=12*1024*1024,"Invalid image size/base64");
             std::vector<unsigned char> bytes(encoded.size()/4*3);
             int count=EVP_DecodeBlock(bytes.data(),reinterpret_cast<const unsigned char *>(encoded.data()),encoded.size());
@@ -39,9 +41,11 @@ VisionInput Vision::input(const json & messages) {
             unsigned char digest[SHA256_DIGEST_LENGTH];SHA256(bytes.data(),bytes.size(),digest);
             std::ostringstream hash;for(auto c:digest) hash<<std::hex<<std::setw(2)<<std::setfill('0')<<int(c);
             out.hashes.push_back(hash.str());
-            auto bitmap=mtmd_helper_bitmap_init_from_buf(ctx.get(),bytes.data(),bytes.size(),false);
-            require(bitmap.bitmap && !bitmap.video_ctx,"Cannot decode image");
+            auto bitmap=mtmd_helper_bitmap_init_from_buf(ctx.get(),bytes.data(),bytes.size(),false,mtmd_helper_init_opt_default());
+            if(bitmap.video_ctx) out.videos.emplace_back(bitmap.video_ctx);
+            require(bitmap.bitmap,"Cannot decode image/video");
             out.bitmaps.emplace_back(bitmap.bitmap,mtmd_bitmap_free);
+            require(type=="input_video" || !bitmap.video_ctx,"Expected an image, received a video");
             require(!mtmd_bitmap_is_audio(bitmap.bitmap),"Audio is unsupported");
             part={{"type","media_marker"},{"text",mtmd_get_marker(ctx.get())}};
         }
@@ -92,7 +96,7 @@ void Vision::append(Session & s, const VisionPrompt & prompt, size_t skip, const
             check();
             if(stream.ctx.ram_rotation) stream.ctx.park();
             const int position=stream.next_position();llama_pos end=position;
-            auto checkpoint=[](llama_batch,void * opaque)->int32_t {
+            auto checkpoint=[](const mtmd_helper_embd_batch *,void * opaque)->int32_t {
                 (*static_cast<const std::function<void()> *>(opaque))();return 0;
             };
             require(mtmd_helper_decode_image_chunk(ctx.get(),stream.ctx.ptr.get(),chunk,mtmd_get_output_embd(ctx.get()),

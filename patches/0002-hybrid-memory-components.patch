@@ -1,11 +1,11 @@
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -719,6 +719,11 @@
+@@ -750,6 +750,11 @@
      // Memory
      //
  
-+    // vcortex experiment: borrowed hybrid components; lifetime is the parent context.
-+    // Return NULL for non-hybrid memory. Mutations require caller-managed coherence.
++    // Borrowed hybrid components; lifetime is the parent context.
++    // Attention mutations on indexed memory must use the coordinated API below.
 +    LLAMA_API llama_memory_t llama_memory_hybrid_attention(llama_memory_t mem);
 +    LLAMA_API llama_memory_t llama_memory_hybrid_recurrent(llama_memory_t mem);
 +
@@ -21,8 +21,8 @@
 +#include "llama-memory-hybrid.h"
  #include "llama-mmap.h"
  #include "llama-model.h"
- #include "llama-ext.h"
-@@ -3849,6 +3850,16 @@
+ #include "llama-moe-cache.h"
+@@ -4264,6 +4265,16 @@
      mem->clear(data);
  }
  

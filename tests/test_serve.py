@@ -67,12 +67,12 @@ def completed():
         {"max_tokens": 2049},
         {"max_tokens": True},
         {"temperature": float("nan")},
-        {"stop": ["x"]},
+        {"stop": [1]},
         {"tools": [None]},
         {"tools": [{"type": "function", "function": None}]},
         {"stream": 1},
         {"session_id": ""},
-        {"reasoning_budget": 32},
+        {"reasoning_budget": -2},
         {"messages": [{"role": "user", "content": [{"type": "image_url"}]}]},
     ],
 )
@@ -275,7 +275,7 @@ def test_thinking_and_long_output_contract():
     assert serve.validate(request, "vcortex-shadow", 16000) is request
     for extra in ({"id_slot": True}, {"id_slot": -1}, {"id_slot": 16},
                   {"id_slot": 0, "session_id": "conflict"},
-                  {"reasoning_budget": 0, "chat_template_kwargs": {"enable_thinking": True}}):
+                  {"reasoning_budget": 0, "reasoning_budget_tokens": 32}):
         with pytest.raises(ValueError):
             serve.validate(body(**extra), "vcortex-shadow", 16000)
 
@@ -329,7 +329,7 @@ def image_body(url=None):
 
 
 @pytest.mark.parametrize("url", [
-    "https://example.org/image.png", "file:///tmp/image.png",
+    "https:///image.png", "file:///tmp/image.png",
     "data:image/png;base64,not base64!", "data:image/png;base64,SGVsbG8=",
     "data:image/svg+xml;base64,PHN2Zz4=",
 ])
@@ -368,3 +368,67 @@ def test_image_role_and_reserved_marker():
         serve.validate(request, "vcortex-shadow", 2048, vision=True)
     with pytest.raises(ValueError, match="Reserved"):
         serve.validate(body(messages=[{"role": "user", "content": "<__media__>"}]), "vcortex-shadow", 2048, vision=True)
+
+
+def test_extended_chat_validation():
+    tool = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    for choice in ("required", {"type": "function", "function": {"name": "lookup"}}):
+        value = body(tools=[tool], tool_choice=choice, parallel_tool_calls=True,
+                     stop=["END", "Конец"], reasoning_budget_tokens=32,
+                     response_format={"type": "json_schema", "json_schema": {"name": "result", "schema": {"type": "object"}}})
+        assert serve.validate(value, "vcortex-shadow", 2048) is value
+    for extra in ({"tool_choice": "required"},
+                  {"tools": [tool], "tool_choice": {"type": "function", "function": {"name": "missing"}}},
+                  {"parallel_tool_calls": 1}, {"stop": False}, {"stop": [""]},
+                  {"reasoning_budget_tokens": 2**31},
+                  {"reasoning_budget": 32, "thinking_budget_tokens": 64},
+                  {"response_format": {"type": "json_object", "schema": []}},
+                  {"response_format": {"type": "json_schema", "json_schema": {"schema": []}}}):
+        with pytest.raises(ValueError):
+            serve.validate(body(**extra), "vcortex-shadow", 2048)
+
+
+def test_remote_image_is_resolved_before_worker():
+    async def scenario():
+        import base64
+        from aiohttp import web
+        from PIL import Image
+        import io
+        buffer = io.BytesIO()
+        Image.new('RGB', (8, 8), 'red').save(buffer, format='PNG')
+        source = web.Application()
+        async def picture(request):
+            return web.Response(body=buffer.getvalue(), content_type='image/png')
+        source.router.add_get('/picture', picture)
+        worker = FakeWorker([completed()])
+        async with TestClient(TestServer(source)) as origin, TestClient(TestServer(serve.make_app(worker, vision=True))) as client:
+            payload = body(messages=[{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': str(origin.make_url('/picture'))}}]}])
+            async with client.post('/v1/chat/completions', json=payload) as response:
+                assert response.status == 200, await response.text()
+            url = worker.submissions[0]['messages'][0]['content'][0]['image_url']['url']
+            assert base64.b64decode(url.split(',', 1)[1]) == buffer.getvalue()
+            payload['messages'][0]['content'][0]['image_url']['url'] = str(origin.make_url('/missing'))
+            async with client.post('/v1/chat/completions', json=payload) as response:
+                assert response.status == 400
+            assert len(worker.submissions) == 1
+    asyncio.run(scenario())
+
+
+def test_video_and_image_format_contract():
+    import base64
+    import io
+    from PIL import Image
+    for fmt in ('PNG', 'JPEG', 'WEBP', 'BMP', 'GIF'):
+        buffer = io.BytesIO()
+        Image.new('RGB', (8, 8), 'blue').save(buffer, format=fmt)
+        payload = image_body(base64.b64encode(buffer.getvalue()).decode())
+        serve.validate(payload, 'vcortex-shadow', 2048, vision=True)
+        part = next(p for p in payload['messages'][0]['content'] if p['type'] == 'image_url')
+        assert part['image_url']['url'].startswith('data:image/')
+    for media in ({'data': 'Ynl0ZXM='}, {'url': 'data:video/mp4;base64,Ynl0ZXM='}, {'url': 'https://example.org/video.mp4'}):
+        request = body(messages=[{'role': 'user', 'content': [{'type': 'input_video', 'input_video': media}]}])
+        serve.validate(request, 'vcortex-shadow', 2048, vision=True)
+        assert request['messages'][0]['content'][0]['input_video']['data']
+    for media in ({}, {'data': ''}, {'data': '!'}, {'url': 'file:///tmp/video.mp4'}):
+        with pytest.raises(ValueError):
+            serve.validate(body(messages=[{'role': 'user', 'content': [{'type': 'input_video', 'input_video': media}]}]), 'vcortex-shadow', 2048, vision=True)

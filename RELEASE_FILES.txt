@@ -13,6 +13,7 @@ config/nemor-shadow.json
 config/shadow-lab.character.json
 deploy/llama-ring.service
 deploy/llm-proxy-shadow.json
+deploy/llm-proxy-flash-next.json
 deps.json
 docs/architecture.md
 docs/experiments.md
@@ -54,6 +55,8 @@ src/runtime.hpp
 src/self_test.cpp
 src/server_session.hpp
 src/server_worker.cpp
+src/stop.hpp
+src/stop_test.cpp
 src/session_test.cpp
 src/shadow.cpp
 src/shadow.hpp
@@ -66,3 +69,14 @@ src/vision_test.cpp
 tests/test_memory_bench.py
 tests/test_release.py
 tests/test_serve.py
+patches/0007-qwen4-ring-memory.patch
+src/qsa_test.cpp
+deploy/model-layout/README.md
+deploy/model-layout/layouts.yaml
+deploy/model-layout/model-layout
+deploy/model-layout/model_layout.py
+deploy/model-layout/prepare_profiles.py
+deploy/model-layout/remote.py
+deploy/model-layout/tests/test_layout.py
+patches/0008-qwen4-private-qsa-cache.patch
+src/qsa_mtp_bench.cpp

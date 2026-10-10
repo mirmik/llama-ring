@@ -17,6 +17,10 @@ without `--context` or `--shared-context 1`.
 At the configured threshold (normally 70% of the shared window), the runner
 captures a cache branch of the prefix and the history accumulated so far. It
 asks the model `Суммаризируй предыдущий текст.` (“Summarize the preceding text.”).
+Flash-Next uses a more explicit user request to prepare a concise summary for
+continuing the conversation, without an acknowledgement. Its fresh upstream
+context can answer the terse request with an acknowledgement or `UNKNOWN`;
+changing cache management alone does not solve that prompt sensitivity.
 This is a general summary, without a list of fact categories to preserve.
 Original system instructions and tool definitions are kept separately and
 reinserted unchanged into the replacement prefix.
@@ -60,6 +64,37 @@ are tracked separately: many image KV cells can share one temporal coordinate.
 Only complete image chunks can be evicted. General nonuniform axis edits and
 video/audio are not supported. The ordinary attention gate is preserved.
 
+## Flash-Next QSA and PLE
+
+The experimental `qwen4exp` text path retains the same mixed-history policy.
+Attention edits coordinate ordinary KV and the QSA indexer cache through
+`llama_memory_attention_seq_rm/cp/add`, passing the complete context memory.
+The borrowed attention component is used for occupancy queries, not independent
+mutations of indexed memory. Recurrent tensors, including PLE convolution
+history, stay with their branch.
+
+Upstream caches pooled QSA keys inside shared indexer cells and allows only
+whole-sequence copies. A partial prefix copy can give one shared raw key different
+neighbors in different branches. `VCORTEX_QWEN4_RING=1` instead pools all blocks
+in the current graph and never writes pooled results back into shared cells.
+Each sequence groups its visible cells in order, including across a P/A gap.
+Arbitrary text cuts therefore do not need rounding to four tokens. This costs
+more pooling work than the upstream incremental cache; it is an experimental
+path focused on correctness. Ordinary upstream contexts retain their default behavior.
+
+Raw indexer keys receive position metadata updates but no RoPE rotation.
+Attention K uses the uniform partial-RoPE shift, including the full-head
+Hadamard undo/redo for Q8. QSA block positions and pooled keys are rebuilt from
+the edited layout. Full native snapshots include both caches and recurrent state.
+
+PLE n-gram predecessors come from the current sequence's token metadata; missing
+predecessors are EOS. After compaction, new tokens therefore see the retained tail
+or, when that tail is empty, the new prefix. The PLE convolution history still
+contains the old stream history, just like GDN recurrence. Existing tail states
+are not recomputed at the new seam. This is an explicit approximation, not an
+equivalence claim to evaluating the new text from scratch. Flash-Next MTP and
+images remain disabled until separately validated.
+
 ## RAM rotation and disk snapshots
 
 `--ram-rotation 1` keeps the live main sequence and one physical scratch sequence
@@ -84,6 +119,9 @@ They are private files (0600), but are not encrypted. Treat them as conversation
 data. This format is incompatible with ordinary llama-server snapshots and is
 not a stable long-term storage format. Direct `session_id` eviction is in-memory
 LRU; a client or proxy must save before eviction for durable continuity.
+Worker compatibility version 5 rejects snapshots from the earlier upstream pin.
+For split GGUF models it records path, size and modification time of every shard,
+not just the metadata shard. These are compatibility checks, not content hashes.
 
 ## MTP
 
@@ -93,6 +131,17 @@ rejected tokens are not emitted. Attention and recurrent state roll back togethe
 Draft state is request-local and starts at the generation suffix. Background
 summaries do not use MTP. Quantized single-token and batched kernels may yield
 slightly different logits; exact cross-backend determinism is not promised.
+
+With GPU offload, Q8 KV and MTP, the runner sets `GGML_VK_DISABLE_MMVQ=1`
+before backend initialization. Vulkan's automatic MMVQ selection can quantize
+activations differently for single-token and verifier batches; on the tested
+Qwen3.5/Vulkan configuration this exceeded the existing numerical tolerance.
+The floating-input path passes that unchanged tolerance. This is a backend
+workaround, not a change to acceptance or recurrent rollback. The setting is
+process-wide; explicit `GGML_VK_FORCE_MMVQ` / `GGML_VK_DISABLE_MMVQ` settings
+are respected. Worker checkpoints record this policy for Q8 MTP sessions.
+Q8 MTP snapshots created before this policy was recorded must be rebuilt from
+their transcripts.
 
 ## What is and is not established
 

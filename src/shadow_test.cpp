@@ -5,7 +5,7 @@
 namespace ring {
 static std::vector<uint8_t> attention_range(Context & ctx, int start, int end) {
     ctx.remove(1);
-    llama_memory_seq_cp(ctx.attention_memory(),0,1,start,end);
+    llama_memory_attention_seq_cp(ctx.memory(),0,1,start,end);
     auto bytes=ctx.state(1);ctx.remove(1);return bytes;
 }
 static std::vector<uint8_t> normalized_state(Context & ctx,int source) {
@@ -93,10 +93,10 @@ json shadow_self_test(Model & model) {
         const auto candidate_normalized=normalized_state(stream.ctx,2);
         Context reference(model,3072);
         reference.restore(stream.ctx.state()); reference.restore(candidate_state,2);
-        require(llama_memory_seq_rm(reference.attention_memory(),0,0,512+shadow.cut),"Reference drop failed");
-        llama_memory_seq_cp(reference.attention_memory(),2,0,0,shadow.candidate.size());
+        require(llama_memory_attention_seq_rm(reference.memory(),0,0,512+shadow.cut),"Reference drop failed");
+        llama_memory_attention_seq_cp(reference.memory(),2,0,0,shadow.candidate.size());
         reference.remove(2);
-        llama_memory_seq_add(reference.attention_memory(),0,0,512,shadow.cut);
+        llama_memory_attention_seq_add(reference.memory(),0,0,512,shadow.cut);
         const auto recurrence=model.hybrid?stream.ctx.recurrent_state():std::vector<uint8_t>{};
         auto event=shadow.at_capacity();
         require(event["ready_before_capacity"].get<bool>() && event["forced_steps"]==0,"Ready path forced work");

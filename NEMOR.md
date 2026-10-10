@@ -17,14 +17,22 @@ Build and start it using the [quickstart](README.md).
 | `DELETE /v1/shadow/sessions/{session_id}` | Reset a named session |
 | `POST /slots/{id}?action=save\|restore\|erase` | Explicit slot checkpoint operations |
 
-Chat supports function tools (`tool_choice: auto/none`), one completion,
+Chat supports function tools (`tool_choice: auto/none/required` or a named
+function), parallel tool calls, one completion,
 `temperature`, `top_p`, `top_k`, `min_p`, repeat/frequency/presence penalties and
 `seed`. Thinking uses `chat_template_kwargs: {"enable_thinking": true}`;
 `reasoning_content` is supported in both history and responses. Keep the returned
 assistant message, including reasoning and tool calls, in subsequent history.
-`reasoning_budget` supports -1 (no separate budget) or 0 with thinking disabled.
-Images require a compatible `--mmproj` and inline PNG/JPEG data URLs. Required
-tool choice, arbitrary stop sequences and response schemas are rejected. This is a subset of the OpenAI API, not a drop-in replacement
+`reasoning_budget`, `reasoning_budget_tokens` and `thinking_budget_tokens` accept
+-1 (unlimited) or a nonnegative token budget. Flash-Next defaults to thinking
+enabled; set `enable_thinking: false` to disable it. Other architectures retain
+their previous default (disabled). `response_format` accepts `json_object` and
+`json_schema`; `stop` accepts a string or array and is honored in JSON and SSE.
+Images require a compatible `--mmproj`; raster image data URLs, raw base64 and
+HTTP(S) URLs are accepted. `input_video` accepts `data` or `url` and uses the
+upstream FFmpeg decoder (4 FPS, timestamps and temporal merging).
+Remote media are fetched before inference with a 30-second timeout and the
+same size limits as inline images. This is a subset of the OpenAI API, not a drop-in replacement
 for every client or llama-server endpoint.
 
 Keep the complete transcript on the client. Use a stable `session_id`, or
@@ -88,6 +96,32 @@ these fragments. The client's original transcript remains its responsibility.
   the proxy's own environment. `{python}`, `{name}`, `{port}`, `{slots}` and
   `{runtime_kv}` are proxy placeholders. Its SlotManager can save one session,
   load another into the sole slot, and restore the first on return.
+- [Aurora Flash-Next runtime](deploy/llm-proxy-flash-next.json): concrete IQ4_XS
+  profile for the existing `model-layout` alias `qwen3.8-flash-next-iq4-xs`,
+  port 8103, native vision projector, shared context 262144, protected-prefix
+  reserve 24576, summary limit 8192, answer limit 32768 and one resident slot.
+  It sets `GGML_VK_DISABLE_MMVQ=1`: Vulkan's automatic quantized matvec mode
+  exceeded the measured tolerance for shifting a video context. This preserves
+  Q8 KV while using floating-point matvec inputs. Keep this setting when
+  starting the Flash-Next vision worker outside the proxy as well.
+  It uses `build-qsa-mtp`, enables sequence-private QSA caching and MTP3,
+  and requires the separate Q8 head under `llama-ring/.models/`.
+  The head path can be changed with `--mtp-model`.
+  Merge its runtime entry and inference timeout into the existing proxy config; it is not a complete
+  replacement config. Preserve existing autoload settings selected by
+  `model-layout`. Before switching, stop the old runtime and archive its native
+  checkpoint directory; those files cannot be restored by this runner. The
+  model alias, proxy URL, credentials and Nemor connection profile stay valid.
+  Atom/Atom-subagent already use runner context management in the inspected
+  installation; Tet also needs `context_management: "runner"` when using ring
+  memory. Large first requests can require a longer client/proxy timeout than
+  short cached turns; the runner profile allows 1800 seconds. For these
+  characters, merge `"context_management": "runner"`, `"send_session_id": true`
+  and `"request_timeout": 1800` for a manual deployment.
+- [model-layout profiles](deploy/model-layout/README.md): `flash-ring` and
+  `27b-ring` select separate runtime aliases and Nemor profiles, with dedicated
+  checkpoint directories. They switch context management and timeouts together
+  with the connection profile; `flash` and `27b` retain the native runtimes.
 
 Choose one process manager for the device. Neither example automatically stops
 other model services. Optional integration probes require separate checkouts:

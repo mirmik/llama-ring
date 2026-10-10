@@ -48,8 +48,8 @@ json hybrid_self_test(Model & model) {
     result["prefix_overflow_atomic"] = true;
     Context reference(model, 2048);
     reference.restore(before);
-    require(llama_memory_seq_rm(reference.attention_memory(), 0, 512, 576), "Reference eviction failed");
-    llama_memory_seq_add(reference.attention_memory(), 0, 0, 512, 64);
+    require(llama_memory_attention_seq_rm(reference.memory(), 0, 512, 576), "Reference eviction failed");
+    llama_memory_attention_seq_add(reference.memory(), 0, 0, 512, 64);
     recurrence = stream.ctx.recurrent_state();
     stream.evict(64);
     // Recurrent tensors are unchanged; restore only the shifted position for

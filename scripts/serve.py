@@ -15,8 +15,9 @@ import math
 from pathlib import Path
 import time
 import uuid
+from urllib.parse import urlsplit
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout, ClientError
 from PIL import Image
 
 LOG = logging.getLogger("shadow")
@@ -25,13 +26,18 @@ LOG = logging.getLogger("shadow")
 def validate_image(part):
     image = part.get("image_url")
     if not isinstance(image, dict) or not isinstance(image.get("url"), str):
-        raise ValueError("image_url must contain a data URL")
+        raise ValueError("image_url must contain a data URL or HTTP(S) URL")
     if image.get("detail", "auto") not in {"auto", "low", "high"}:
         raise ValueError("Invalid image detail")
     url = image["url"]
+    parsed = urlsplit(url)
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        return
     header, separator, payload = url.partition(",")
-    if not separator or header not in {"data:image/png;base64", "data:image/jpeg;base64"}:
-        raise ValueError("Only inline PNG/JPEG data URLs are supported; remote URLs are not fetched")
+    if not url.startswith("data:"):
+        payload = url  # llama-server also accepts raw base64.
+    elif not separator or not header.startswith("data:image/") or not header.endswith(";base64"):
+        raise ValueError("Use an image data URL, raw base64 or HTTP(S) image URL")
     if len(payload) > 12 * 1024 * 1024:
         raise ValueError("Image exceeds 8 MiB")
     try:
@@ -41,11 +47,66 @@ def validate_image(part):
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             with Image.open(io.BytesIO(data)) as decoded:
-                if decoded.format not in {"PNG", "JPEG"} or decoded.width * decoded.height > 16_000_000:
-                    raise ValueError("Expected PNG/JPEG with at most 16 million pixels")
+                if decoded.format not in {"PNG", "JPEG", "GIF", "BMP", "WEBP", "TGA", "PPM", "PSD"} or decoded.width * decoded.height > 16_000_000:
+                    raise ValueError("Unsupported image format or more than 16 million pixels")
                 decoded.verify()
+        if not url.startswith("data:"):
+            image["url"] = "data:image/octet-stream;base64," + payload
     except (OSError, SyntaxError, binascii.Error, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         raise ValueError("Invalid or oversized image") from exc
+
+
+def validate_video(part):
+    video = part.get("input_video")
+    if not isinstance(video, dict):
+        raise ValueError("input_video must contain data or url")
+    data = video.get("data", video.get("url"))
+    if not isinstance(data, str) or not data:
+        raise ValueError("input_video must contain data or url")
+    parsed = urlsplit(data)
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        video["data"] = data
+        return
+    if data.startswith("data:"):
+        header, separator, data = data.partition(",")
+        if not separator or not header.endswith(";base64"):
+            raise ValueError("Video data URL must contain base64")
+    try:
+        if len(data) > 12 * 1024 * 1024:
+            raise ValueError("Video exceeds 8 MiB")
+        raw = base64.b64decode(data, validate=True)
+        if not raw or len(raw) > 8 * 1024 * 1024:
+            raise ValueError("Invalid or oversized video")
+    except binascii.Error as exc:
+        raise ValueError("Invalid video base64") from exc
+    video["data"] = data
+
+
+async def resolve_images(body):
+    """Resolve image/video URLs before the single-owner GPU queue."""
+    parts = [part for msg in body["messages"] if isinstance(msg.get("content"), list)
+             for part in msg["content"] if part.get("type") in {"image_url", "input_video"}]
+    if not parts:
+        return
+    async with ClientSession(timeout=ClientTimeout(total=30)) as client:
+        for part in parts:
+            video = part["type"] == "input_video"
+            media = part["input_video"] if video else part["image_url"]
+            key = "data" if video else "url"
+            if urlsplit(media[key]).scheme not in {"http", "https"}:
+                continue
+            try:
+                async with client.get(media[key]) as response:
+                    response.raise_for_status()
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        data.extend(chunk)
+                        if len(data) > 8 * 1024 * 1024:
+                            raise ValueError("Media exceeds 8 MiB")
+                media[key] = base64.b64encode(data).decode("ascii")
+                (validate_video if video else validate_image)(part)
+            except (ClientError, asyncio.TimeoutError, OSError) as exc:
+                raise ValueError("Could not fetch or decode media URL") from exc
 
 
 def validate(body, model, max_output, vision=False):
@@ -56,6 +117,9 @@ def validate(body, model, max_output, vision=False):
         "messages",
         "tools",
         "tool_choice",
+        "parallel_tool_calls",
+        "response_format",
+        "stop",
         "stream",
         "stream_options",
         "session_id",
@@ -71,6 +135,8 @@ def validate(body, model, max_output, vision=False):
         "seed",
         "chat_template_kwargs",
         "reasoning_budget",
+        "reasoning_budget_tokens",
+        "thinking_budget_tokens",
         "n",
     }
     unknown = set(body) - allowed
@@ -96,7 +162,7 @@ def validate(body, model, max_output, vision=False):
             for part in content:
                 if not isinstance(part, dict):
                     raise ValueError("Invalid content part")
-                if part.get("type") == "image_url":
+                if part.get("type") in {"image_url", "input_video"}:
                     if not vision:
                         raise ValueError("Images are unsupported: configure --mmproj")
                     if msg["role"] != "user":
@@ -104,9 +170,9 @@ def validate(body, model, max_output, vision=False):
                     image_count += 1
                     if image_count > 32:
                         raise ValueError("At most 32 images per request")
-                    validate_image(part)
+                    (validate_video if part["type"] == "input_video" else validate_image)(part)
                 elif part.get("type") != "text" or not isinstance(part.get("text"), str):
-                    raise ValueError("Only text and image_url content parts are supported")
+                    raise ValueError("Only text, image_url and input_video content parts are supported")
                 elif "<__media__>" in part["text"]:
                     raise ValueError("Reserved media marker in text")
         elif content is not None and not isinstance(content, str):
@@ -117,15 +183,35 @@ def validate(body, model, max_output, vision=False):
             raise ValueError("Images are unsupported")
         if msg.get("reasoning_content") is not None and not isinstance(msg["reasoning_content"], str):
             raise ValueError("reasoning_content must be a string")
-    if body.get("n", 1) != 1 or body.get("tool_choice", "auto") not in ("auto", "none"):
-        raise ValueError("Only n=1 and tool_choice=auto/none are supported")
+    if body.get("n", 1) != 1:
+        raise ValueError("Only n=1 is supported")
+    choice = body.get("tool_choice", "auto")
+    named_tool = isinstance(choice, dict) and choice.get("type") == "function" and isinstance(choice.get("function"), dict) and isinstance(choice["function"].get("name"), str)
+    if not named_tool and choice not in ("auto", "none", "required"):
+        raise ValueError("Invalid tool_choice")
+    if "parallel_tool_calls" in body and type(body["parallel_tool_calls"]) is not bool:
+        raise ValueError("parallel_tool_calls must be boolean")
+    stops = body.get("stop")
+    if stops is None:
+        stops = []
+    if isinstance(stops, str):
+        stops = [stops]
+    if not isinstance(stops, list) or any(not isinstance(s, str) or not s for s in stops):
+        raise ValueError("stop must be a string or an array of nonempty strings")
+    fmt = body.get("response_format")
+    if fmt is not None:
+        if not isinstance(fmt, dict) or fmt.get("type") not in ("text", "json_object", "json_schema"):
+            raise ValueError("Invalid response_format")
+        if fmt["type"] == "json_schema" and (not isinstance(fmt.get("json_schema"), dict) or not isinstance(fmt["json_schema"].get("schema"), dict)):
+            raise ValueError("response_format.json_schema.schema must be an object")
+        if fmt["type"] == "json_object" and "schema" in fmt and not isinstance(fmt["schema"], dict):
+            raise ValueError("response_format.schema must be an object")
     template = body.get("chat_template_kwargs", {})
     if not isinstance(template, dict) or set(template) - {"enable_thinking"} or ("enable_thinking" in template and type(template["enable_thinking"]) is not bool):
         raise ValueError("Only boolean chat_template_kwargs.enable_thinking is supported")
-    if type(body.get("reasoning_budget", -1)) is not int or body.get("reasoning_budget", -1) not in (-1, 0):
-        raise ValueError("Only unlimited (-1) or disabled (0) reasoning budget is supported")
-    if body.get("reasoning_budget") == 0 and template.get("enable_thinking", False):
-        raise ValueError("reasoning_budget=0 requires enable_thinking=false")
+    budgets = [body[k] for k in ("reasoning_budget", "reasoning_budget_tokens", "thinking_budget_tokens") if k in body]
+    if any(type(b) is not int or not -1 <= b <= 2**31 - 1 for b in budgets) or len(set(budgets)) > 1:
+        raise ValueError("Reasoning budget must be -1 or a nonnegative integer; aliases must agree")
     if "id_slot" in body:
         if type(body["id_slot"]) is not int or not 0 <= body["id_slot"] < 16:
             raise ValueError("id_slot must be an integer in [0, 15]")
@@ -178,6 +264,10 @@ def validate(body, model, max_output, vision=False):
                 or not isinstance(tool.get("function", {}).get("name"), str)
             ):
                 raise ValueError("Invalid function tool")
+    if (choice == "required" or named_tool) and not body.get("tools"):
+        raise ValueError("tool_choice requires tools")
+    if named_tool and choice["function"]["name"] not in {t["function"]["name"] for t in body["tools"]}:
+        raise ValueError("Named tool_choice must name a supplied tool")
     return body
 
 
@@ -321,6 +411,7 @@ def make_app(
                 "streaming": True,
                 "tools": True,
                 "vision": vision,
+                "video": vision,
                 "reasoning": True,
                 "session_id": True,
                 "shadow_memory": True,
@@ -340,6 +431,7 @@ def make_app(
     async def chat(request):
         try:
             body = validate(await request.json(), model, max_output, vision)
+            await resolve_images(body)
         except (ValueError, TypeError, AttributeError) as exc:
             return error_response(str(exc))
         try:
@@ -490,6 +582,7 @@ def make_app(
     async def inspect_prompt(request):
         try:
             body = validate(await request.json(), model, max_output, vision)
+            await resolve_images(body)
         except (ValueError, TypeError, AttributeError) as exc:
             return error_response(str(exc))
         request_id, target = await worker.submit({**body, "op": "inspect"})
@@ -571,8 +664,8 @@ def make_app(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--mmproj", help="Compatible qwen35 vision projector GGUF")
-    parser.add_argument("--image-max-tokens", type=int, default=1024)
+    parser.add_argument("--mmproj", help="Compatible qwen35 or qwen4exp vision projector GGUF")
+    parser.add_argument("--image-max-tokens", type=int, help="-1 preserves projector limits; defaults to -1 for Flash-Next, 1024 for qwen35")
     parser.add_argument("--mmproj-gpu", type=int, choices=(0, 1), default=1, help="Use 0 to encode images on CPU and keep GPU memory for the language model")
     parser.add_argument("--model-name", default="vcortex-shadow")
     parser.add_argument("--slot-save-path", default="", help="Private directory for full shadow session checkpoints")
@@ -604,6 +697,7 @@ def main():
     parser.add_argument("--cache-type", choices=("f16", "q8_0"), default="f16")
     parser.add_argument("--shared-context", type=int, choices=(0, 1), default=0)
     parser.add_argument("--ram-rotation", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--mtp-model", help="Separate Flash-Next MTP head GGUF")
     parser.add_argument("--mtp-draft", type=int, choices=range(9), default=0)
     parser.add_argument("--trigger", type=float, default=0.7)
     parser.add_argument("--max-pending", type=int, default=8)
@@ -640,8 +734,14 @@ def main():
         "shared-context",
     ):
         command += ["--" + name, str(getattr(args, name.replace("-", "_")))]
+    if args.mtp_model:
+        if not args.mtp_draft:
+            parser.error("--mtp-model requires --mtp-draft > 0")
+        command += ["--mtp-model", args.mtp_model]
     if args.mmproj:
-        command += ["--mmproj", args.mmproj, "--image-max-tokens", str(args.image_max_tokens), "--mmproj-gpu", str(args.mmproj_gpu)]
+        command += ["--mmproj", args.mmproj, "--mmproj-gpu", str(args.mmproj_gpu)]
+        if args.image_max_tokens is not None:
+            command += ["--image-max-tokens", str(args.image_max_tokens)]
     if args.slot_save_path:
         command += ["--slot-save-path", args.slot_save_path]
     logging.basicConfig(level=logging.INFO)

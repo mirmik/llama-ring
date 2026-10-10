@@ -1,0 +1,18 @@
+{
+  "inference": {
+    "request_timeout_seconds": 1800
+  },
+  "runtimes": {
+    "qwen3.8-flash-next-iq4-xs": {
+      "driver": "llama_cpp",
+      "gpu": "local",
+      "autoload": false,
+      "on_demand": false,
+      "port": 8103,
+      "slots": 1,
+      "context": 262144,
+      "startup_timeout": 900,
+      "command": "env GGML_VK_DISABLE_MMVQ=1 {python} /home/mirmik/project/vcortex/llama-ring/scripts/serve.py --worker /home/mirmik/project/vcortex/llama-ring/build-qsa-mtp/bin/llama-shadow-worker --model /home/mirmik/project/models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf --mmproj /home/mirmik/project/models/Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf --model-name {name} --host 127.0.0.1 --port {port} --context 262144 --prefix 24576 --max-summary 8192 --max-output 32768 --max-sessions {slots} --quantum 256 --trigger .7 --cache-type q8_0 --ram-rotation 1 --mtp-draft 3 --mtp-model /home/mirmik/project/vcortex/llama-ring/.models/mtp-Qwen3.8-Flash-Next-Q8_0.gguf --timeout 1800 --slot-save-path {runtime_kv}"
+    }
+  }
+}

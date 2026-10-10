@@ -13,3 +13,4 @@ runs/
 checkpoints/
 *.checkpoint
 deploy/proxy-before.json
+.models/

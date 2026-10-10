@@ -1,0 +1,216 @@
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1221,7 +1221,8 @@
+         // Qwen35: only uniform translations of all M-RoPE axes are supported.
+         // The same delta on every axis permits the existing NEOX K-shift.
+         const char * text_shift = getenv("VCORTEX_QWEN35_TEXT_SHIFT");
+-        return model.arch == LLM_ARCH_QWEN35 && text_shift && strcmp(text_shift, "1") == 0;
++        return (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) &&
++               text_shift && strcmp(text_shift, "1") == 0;
+     }
+     return true;
+ }
+@@ -2065,7 +2066,7 @@
+         // across the entire head. Undo that rotation on all coordinates,
+         // apply RoPE to n_rot, then rotate/quantize the full head again.
+         // A view of n_rot would incorrectly join slices of different heads.
+-        const auto shift_width = model.arch == LLM_ARCH_QWEN35 && n_rot_k
++        const auto shift_width = (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN4EXP) && n_rot_k
+                                ? n_embd_head_k : n_rot;
+         ggml_tensor * k =
+             ggml_view_3d(ctx, layer.k,
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -76,6 +76,12 @@
+     // llama_memory_hybrid_idx specific API
+     //
+ 
++    // Ring mode computes pooled keys per graph, so partially shared sequences cannot alias them.
++    bool ring_pooling() const { return ring_pool; }
++    bool ring_attn_rm(llama_seq_id seq, llama_pos p0, llama_pos p1);
++    void ring_attn_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
++    void ring_attn_add(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos shift);
++
+     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+ 
+     // The model's indexer pool size.
+@@ -114,6 +120,7 @@
+ 
+     // the indexer cache holds one key head per layer, so it needs its own hparams:
+     // llama_kv_cache keeps a reference to what it is given
++    const bool ring_pool;
+     llama_hparams hparams_idx;
+ 
+     const std::unique_ptr<llama_kv_cache> mem_idx;
+@@ -190,7 +197,8 @@
+ 
+     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
+     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+-    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
++    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
++    bool ring_pooling() const { return mem->ring_pooling(); }
+     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
+     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -49,6 +49,8 @@
+         type_r, type_s, rs_size,
+         n_seq_max, n_rs_seq, offload, unified,
+         filter_attn, filter_recr),
++    ring_pool(model.arch == LLM_ARCH_QWEN4EXP && getenv("VCORTEX_QWEN4_RING") != nullptr &&
++              strcmp(getenv("VCORTEX_QWEN4_RING"), "1") == 0),
+     hparams_idx(model.hparams),
+     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+@@ -180,6 +182,27 @@
+     }
+ 
+     return p0;
++}
++
++bool llama_memory_hybrid_idx::ring_attn_rm(llama_seq_id seq, llama_pos p0, llama_pos p1) {
++    GGML_ASSERT(ring_pool);
++    mem_idx_stale_set(-1, 0);
++    if (mem_idx && !mem_idx->seq_rm(seq, p0, p1)) { return false; }
++    return get_mem_attn()->seq_rm(seq, p0, p1);
++}
++
++void llama_memory_hybrid_idx::ring_attn_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
++    GGML_ASSERT(ring_pool);
++    get_mem_attn()->seq_cp(src, dst, p0, p1);
++    if (mem_idx) { mem_idx->seq_cp(src, dst, p0, p1); }
++    mem_idx_stale_set(-1, 0);
++}
++
++void llama_memory_hybrid_idx::ring_attn_add(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos shift) {
++    GGML_ASSERT(ring_pool);
++    get_mem_attn()->seq_add(seq, p0, p1, shift);
++    if (mem_idx) { mem_idx->seq_add(seq, p0, p1, shift); }
++    mem_idx_stale_set(-1, 0);
+ }
+ 
+ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -731,7 +754,7 @@
+ }
+ 
+ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
+-    return kpool_cur().n_new_g;
++    return mem->ring_pooling() ? get_n_kpool() : kpool_cur().n_new_g;
+ }
+ 
+ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+@@ -751,9 +774,9 @@
+ 
+     const uint32_t n_tokens = ubatch->n_tokens;
+     const uint32_t n_pool   = (uint32_t) pool_cells->ne[0];
+-    const uint32_t n_new    = st.n_new;
++    const uint32_t n_new    = mem->ring_pooling() ? st.n_pool_real : st.n_new;
+     // the graph always pools at least one entry, padded to a stable bound, see kpool_build_state
+-    const uint32_t n_new_g  = st.n_new_g;
++    const uint32_t n_new_g  = get_n_kpool_new();
+ 
+     const bool by_order = mem->get_kpool_by_order();
+ 
+@@ -862,7 +885,7 @@
+                 pidx[(size_t) ip*kpool + k] = inert ? sentinel : (int32_t) sq.cells[j + k].second;
+             }
+ 
+-            if (st.is_new[ip] == st.generation) {
++            if (mem->ring_pooling() || st.is_new[ip] == st.generation) {
+                 GGML_ASSERT(i_new < n_new);
+                 for (uint32_t k = 0; k < kpool; ++k) {
+                     nidx[(size_t) i_new*kpool + k] = (int32_t) gcell(sq, sq.cells[j + k].second);
+@@ -887,7 +910,13 @@
+ 
+     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
+     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
+-    if (n_new_g > n_new) {
++    if (mem->ring_pooling()) {
++        // No scatter in ring mode: padded rows may reuse any initialized raw key.
++        for (uint32_t i = n_new; i < n_new_g; ++i) {
++            std::fill(nidx + i*kpool, nidx + (i + 1)*kpool, (int32_t) dummy_cell);
++            nrep[i] = dummy_cell;
++        }
++    } else if (n_new_g > n_new) {
+         std::vector<int64_t> reps(pcell, pcell + pool_end.size());
+         std::sort(reps.begin(), reps.end());
+ 
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -726,6 +726,7 @@
+     // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
+     inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
+     ggml_set_input(inp->new_pool_rep);
++    ggml_build_forward_expand(gf, inp->new_pool_rep);
+     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
+     ggml_set_input(inp->new_pool_pos);
+ 
+@@ -785,8 +786,15 @@
+ 
+     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
+     // the older pools come from the rows earlier ubatches wrote
+-    ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
+-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
++    ggml_tensor * pooled;
++    if (mctx_hyb->ring_pooling()) {
++        // Partial prefix copies may give a shared raw key different block neighbors.
++        // Keep each sequence's pooled keys in this graph, never in a shared cell.
++        pooled = pooled_new;
++    } else {
++        ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
++        pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
++    }
+     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+     cb(pooled, "indexer_k", il);
+ 
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -755,6 +755,12 @@
+     LLAMA_API llama_memory_t llama_memory_hybrid_attention(llama_memory_t mem);
+     LLAMA_API llama_memory_t llama_memory_hybrid_recurrent(llama_memory_t mem);
+ 
++    // Attention-only edits preserve recurrence and coordinate QSA indexer state.
++    // Pass the whole context memory. Indexed memory requires opt-in ring pooling.
++    LLAMA_API bool llama_memory_attention_seq_rm(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1);
++    LLAMA_API void llama_memory_attention_seq_cp(llama_memory_t mem, llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
++    LLAMA_API void llama_memory_attention_seq_add(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta);
++
+     // Clear the memory contents
+     // If data == true, the data buffers will also be cleared together with the metadata
+     LLAMA_API void llama_memory_clear(
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -8,6 +8,7 @@
+ #include "llama-io.h"
+ #include "llama-memory.h"
+ #include "llama-memory-hybrid.h"
++#include "llama-memory-hybrid-idx.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -4275,6 +4276,24 @@
+     return hybrid ? hybrid->get_mem_recr() : nullptr;
+ }
+ 
++bool llama_memory_attention_seq_rm(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1) {
++    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) { return idx->ring_attn_rm(seq, p0, p1); }
++    auto * attn = llama_memory_hybrid_attention(mem);
++    return (attn ? attn : mem)->seq_rm(seq, p0, p1);
++}
++
++void llama_memory_attention_seq_cp(llama_memory_t mem, llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
++    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) { idx->ring_attn_cp(src, dst, p0, p1); return; }
++    auto * attn = llama_memory_hybrid_attention(mem);
++    (attn ? attn : mem)->seq_cp(src, dst, p0, p1);
++}
++
++void llama_memory_attention_seq_add(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta) {
++    if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) { idx->ring_attn_add(seq, p0, p1, delta); return; }
++    auto * attn = llama_memory_hybrid_attention(mem);
++    (attn ? attn : mem)->seq_add(seq, p0, p1, delta);
++}
++
+ bool llama_memory_seq_rm(
+         llama_memory_t mem,
+           llama_seq_id seq_id,

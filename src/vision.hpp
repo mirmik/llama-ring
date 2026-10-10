@@ -1,10 +1,12 @@
 #pragma once
 #include "server_session.hpp"
 #include "mtmd.h"
+#include "mtmd-helper.h"
 
 namespace ring {
 struct VisionInput {
     json messages;
+    std::vector<mtmd_helper::video_ptr> videos;
     std::vector<std::unique_ptr<mtmd_bitmap,decltype(&mtmd_bitmap_free)>> bitmaps;
     std::vector<std::string> hashes;
 };

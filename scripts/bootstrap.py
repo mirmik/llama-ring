@@ -11,8 +11,10 @@ root = Path(__file__).resolve().parents[1]
 lock = json.loads((root / 'deps.json').read_text())
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source', type=Path, help='Existing llama.cpp Git repository (read-only)')
+parser.add_argument('--destination', type=Path, default=root / '.deps/llama.cpp',
+                    help='Fresh destination directory (default: .deps/llama.cpp)')
 args = parser.parse_args()
-destination = root / '.deps/llama.cpp'
+destination = args.destination.resolve()
 if destination.exists():
     raise SystemExit(f'{destination} already exists; use a fresh directory to avoid overwriting changes')
 destination.parent.mkdir(parents=True, exist_ok=True)

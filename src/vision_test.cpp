@@ -7,32 +7,43 @@
 using namespace ring;
 int main(int argc,char **argv) {
     try {
-        require(argc>=4,"llama-vision-test MODEL MMPROJ MESSAGES_JSON [gpu_layers]");
+        require(argc>=4,"llama-vision-test MODEL MMPROJ MESSAGES_JSON [gpu_layers] [f16|q8_0] [--shifts-only]");
         setenv("VCORTEX_LLAMA_ALLOW_NONCONTIGUOUS","1",1);
-        Model model(argv[1],argc>4?std::stoi(argv[4]):99,"q8_0");
+        Model model(argv[1],argc>4?std::stoi(argv[4]):99,argc>5?argv[5]:"q8_0");
         Vision vision(model,argv[2],argc<=4 || std::stoi(argv[4])>0,256);
         std::ifstream in(argv[3]);auto input=vision.input(json::parse(in));
         const auto text=message("user",std::string(mtmd_get_marker(vision.ctx.get()))+"What is in the image?");
         auto prompt=vision.tokenize(text,input);
         json results=json::array();
-        // Reference image decode at rebased coordinates versus lazy uniform K shift.
-        for(int delta:{37,-37}) {
+        bool shifts_ok=true;
+        // A uniform translation must preserve this already-computed state.
+        // Fresh replay also changes prefill rounding/routing, so measure its
+        // own translation drift separately instead of attributing it to K-shift.
+        for(int delta:{0,37,-37}) {
             Context shifted(model,8192),reference(model,8192);
             llama_pos old_end=0,new_end=0;const int origin=100;
             require(mtmd_helper_eval_chunks(vision.ctx.get(),shifted.ptr.get(),prompt.chunks.get(),origin,0,512,false,&old_end)==0,"Reference image prefill failed");
             auto snapshot=shifted.state();
+            auto suffix=model.tokens(model.generation_prompt());
+            shifted.decode(suffix,old_end,0,true);
+            const auto original=shifted.logits();
             shifted.restore(snapshot);
-            llama_memory_seq_add(shifted.attention_memory(),0,origin,-1,delta);
+            llama_memory_attention_seq_add(shifted.memory(),0,origin,-1,delta);
             llama_memory_seq_add(shifted.recurrent_memory(),0,origin,-1,delta);
             require(mtmd_helper_eval_chunks(vision.ctx.get(),reference.ptr.get(),prompt.chunks.get(),origin+delta,0,512,false,&new_end)==0,"Shift control prefill failed");
-            auto suffix=model.tokens(model.generation_prompt());
             shifted.decode(suffix,old_end+delta,0,true);reference.decode(suffix,new_end,0,true);
             auto metric=compare_logits(reference.logits(),shifted.logits());
-            results.push_back({{"delta",delta},{"metrics",metric}});
-            require(metric.at("kl").get<double>()<0.02,"Image shift KL exceeds tolerance");
+            auto cached=compare_logits(original,shifted.logits());
+            results.push_back({{"delta",delta},{"metrics",metric},
+                {"cached_translation",cached},
+                {"fresh_translation",compare_logits(original,reference.logits())}});
+            std::cerr << results.back().dump() << '\n';
+            shifts_ok &= cached.at("kl").get<double>()<0.02;
+            if(delta==0) shifts_ok &= metric.at("kl").get<double>()<1e-6;
         }
         // Atomic image accounting, RAM branches, and exact disk round trip.
         for(bool ram:{false,true}) {
+            if(argc>6 && std::string(argv[6])=="--shifts-only") break;
             auto check=[]{};
             Session s(model,1024,3072,64,64,256,.7,ram,message("system","Be concise."),"vision-test",check,true,true);
             vision.append(s,prompt,0,check);s.ledger=prompt.tokens;s.image_ledger=input.hashes;
@@ -71,6 +82,7 @@ int main(int argc,char **argv) {
             require(rejected,"Image accepted a split boundary");
             results.push_back({{"ram",ram},{"atomic_early_commit",true},{"images",s.stream.images.size()}});
         }
-        std::cout<<json({{"completed",true},{"results",results}}).dump(2)<<'\n';
+        std::cout<<json({{"completed",shifts_ok},{"shift_reference","original_cached_state"},{"results",results}}).dump(2)<<'\n';
+        require(shifts_ok,"Image shift KL exceeds tolerance");
     } catch(const std::exception & e) {std::cerr<<e.what()<<'\n';return 1;}
 }

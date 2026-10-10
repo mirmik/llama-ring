@@ -8,7 +8,7 @@
 +        // across the entire head. Undo that rotation on all coordinates,
 +        // apply RoPE to n_rot, then rotate/quantize the full head again.
 +        // A view of n_rot would incorrectly join slices of different heads.
-+        const auto shift_width = model.arch == LLM_ARCH_QWEN35 && attn_rot_k
++        const auto shift_width = model.arch == LLM_ARCH_QWEN35 && n_rot_k
 +                               ? n_embd_head_k : n_rot;
          ggml_tensor * k =
              ggml_view_3d(ctx, layer.k,

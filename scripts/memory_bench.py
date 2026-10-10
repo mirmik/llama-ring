@@ -23,15 +23,18 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def summary_instruction():
-    source = Path(__file__).resolve().parents[1] / "src/server_session.hpp"
-    match = re.search(r'shadow\.instruction_override\s*=\s*((?:"(?:\\.|[^"\\])*"\s*)+);', source.read_text())
+def summary_instruction(architecture="qwen35"):
+    if architecture not in {"qwen3", "qwen35", "qwen4exp"}:
+        raise ValueError(f"Unsupported architecture: {architecture}")
+    source = Path(__file__).resolve().parents[1] / "src/shadow.cpp"
+    name = "indexed_instruction" if architecture == "qwen4exp" else "instruction"
+    match = re.search(r'\b' + name + r'\s*=\s*((?:"(?:\\.|[^"\\])*"\s*)+);', source.read_text())
     if not match:
         raise ValueError(f"Missing literal summary instruction in {source}")
     instruction = "".join(ast.literal_eval(s) for s in re.findall(r'"(?:\\.|[^"\\])*"', match[1]))
     if not instruction.strip():
         raise ValueError("Empty summary instruction")
-    return instruction, {"path": "src/server_session.hpp", "sha256": sha(source)}
+    return instruction, {"path": "src/shadow.cpp", "sha256": sha(source), "architecture": architecture}
 
 
 def normalize(text):
@@ -77,7 +80,7 @@ def prepare(a):
             return ast.Constant(system)
 
     templates = ast.literal_eval(Literals().visit(templates_node))
-    instruction, instruction_source = summary_instruction()
+    instruction, instruction_source = summary_instruction(a.architecture)
     conflict = pq.read_table(a.data / "Conflict_Resolution.parquet").to_pylist()
     retrieval = pq.read_table(a.data / "Accurate_Retrieval.parquet").to_pylist()
     selected = [
@@ -170,6 +173,7 @@ if __name__ == "__main__":
     q.add_argument("--upstream", type=Path, required=True)
     q.add_argument("--output", type=Path, required=True)
     q.add_argument("--seed", type=int, default=17)
+    q.add_argument("--architecture", choices=["qwen3", "qwen35", "qwen4exp"], default="qwen35")
     q = sub.add_parser("score")
     q.add_argument("--gold", type=Path, required=True)
     q.add_argument("--result", type=Path, required=True)

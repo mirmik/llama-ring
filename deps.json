@@ -1,11 +1,13 @@
 {
   "repository": "https://github.com/ggml-org/llama.cpp.git",
-  "revision": "c0bc8591e8815c63cb01dd3f051a8b0df02501c9",
+  "revision": "50e3e3e480c80b9ee0ea067e475602d540dc62c8",
   "patches": [
     "patches/0001-opt-in-sparse-positions.patch",
     "patches/0002-hybrid-memory-components.patch",
     "patches/0004-qwen35-text-only-shift.patch",
     "patches/0005-qwen35-quantized-partial-shift.patch",
-    "patches/0006-qwen35-image-uniform-shift.patch"
+    "patches/0006-qwen35-image-uniform-shift.patch",
+    "patches/0007-qwen4-ring-memory.patch",
+    "patches/0008-qwen4-private-qsa-cache.patch"
   ]
 }

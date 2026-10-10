@@ -18,6 +18,20 @@ def test_current_summary_instruction():
     assert source["sha256"] == bench.sha(path)
 
 
+def test_flash_summary_instruction_and_provenance():
+    instruction, source = bench.summary_instruction("qwen4exp")
+    assert "для продолжения разговора" in instruction
+    assert "без подтверждения выполнения" in instruction
+    assert instruction != bench.summary_instruction("qwen35")[0]
+    assert source["architecture"] == "qwen4exp"
+    assert source["sha256"] == bench.sha(Path(__file__).parents[1] / source["path"])
+
+
+def test_reject_unknown_summary_architecture():
+    with pytest.raises(ValueError, match="Unsupported architecture"):
+        bench.summary_instruction("unknown")
+
+
 @pytest.mark.parametrize("text,substring,strict", [
     ("The Red Boat.", True, True),
     ("Answer: Red Boat", True, False),

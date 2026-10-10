@@ -18,12 +18,13 @@ std::string trim(std::string text);
 std::string message(const std::string & role, const std::string & text);
 struct Model {
     std::unique_ptr<llama_model, decltype(&llama_model_free)> ptr{nullptr, llama_model_free};
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> mtp_model{nullptr, llama_model_free};
     const llama_vocab * vocab;
     std::string architecture, name;
-    bool hybrid = false;
+    bool hybrid = false, indexed = false;
     ggml_type cache_type;
     int mtp_draft = 0;
-    Model(const std::string & path, int gpu_layers, const std::string & cache = "f16", int mtp_draft = 0);
+    Model(const std::string & path, int gpu_layers, const std::string & cache = "f16", int mtp_draft = 0, const std::string & mtp_path = "");
     Tokens tokens(const std::string & text, bool special = true) const;
     std::string text(const Tokens & ids, bool special = false) const;
     std::string generation_prompt() const;

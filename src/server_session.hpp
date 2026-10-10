@@ -30,7 +30,6 @@ struct Session {
             stream.append_prefix(Tokens(ids.begin()+offset,ids.begin()+end));
         }
         if(shared) {stream.enable_flexible();shadow.refresh_layout();}
-        shadow.instruction_override = "Суммаризируй предыдущий текст.";
         shadow.prefix_builder = [this,&model](const std::string & memory) {
             return model.tokens(immutable + message("system", "Memory revision " + std::to_string(shadow.generation) +
                 ": earlier conversation has been summarized. Exact earlier wording may no longer be available; "
