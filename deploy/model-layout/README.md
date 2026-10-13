@@ -214,8 +214,9 @@ Flash profile на самом узле .76. Старые profiles не пере�
 поэтому переключатель останавливает их и отключает автоматический запуск.
 Изменение конфигурации режимов само по себе не перезапускает текущую сессию Nemor.
 
-Оба Strata-профиля теперь включают изображения: CPU `strata-vision` +
-`mmproj-F16.gguf`, до 1024 visual tokens на картинку. Ring сохраняет embeddings
+Оба Strata-профиля включают изображения с `mmproj-F16.gguf`, до 1024 visual
+tokens на картинку. С 2026-10-11 ring использует HIP `strata-vision` на AMD GPU,
+plain сохраняет CPU encoder; замеры и deployment — `vcortex/experiments/070-strata-vision-gpu.md`. Ring сохраняет embeddings
 в checkpoint и учитывает M-RoPE при кольцевом сжатии. Проверка —
 `vcortex/experiments/064-strata-vision.md`.
 

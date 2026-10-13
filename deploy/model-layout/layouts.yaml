@@ -105,6 +105,7 @@ nodes:
     - /home/mirmik/project/vcortex/.deps/strata-v0.1.40/build-halo/strata
     - /home/mirmik/project/vcortex/.deps/strata-ring/build-halo/strata
     - /home/mirmik/project/vcortex/.deps/strata-vision-cpu/bin/strata-vision
+    - /home/mirmik/project/vcortex/.deps/strata-vision-hip/bin/strata-vision
     - /home/mirmik/project/vcortex/.deps/strata-data/iq4-xs/tokenizer
     - /home/mirmik/project/vcortex/.deps/strata-data/mtp-rt
     - /home/mirmik/project/vcortex/.deps/rocm7141/install/lib/libamdhip64.so
